@@ -21,6 +21,13 @@ _FFMPEG_BUILDS_URL = (
 _FFMPEG_CACHE: str | None = None
 
 
+def _disk_free_mb(path: Path) -> float:
+    try:
+        return shutil.disk_usage(path).free / (1024 * 1024)
+    except OSError:
+        return 0.0
+
+
 def _resolve_ffmpeg_location() -> str | None:
     """Return ffmpeg directory for yt-dlp, bootstrapping static builds if needed."""
     global _FFMPEG_CACHE
@@ -49,6 +56,10 @@ def _resolve_ffmpeg_location() -> str | None:
         _FFMPEG_CACHE = ""
         return None
 
+    if _disk_free_mb(cache_dir if cache_dir.exists() else cache_dir.parent) < 200:
+        _FFMPEG_CACHE = ""
+        return None
+
     cache_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as tmp:
         archive = Path(tmp) / "ffmpeg.tar.xz"
@@ -65,11 +76,12 @@ def _resolve_ffmpeg_location() -> str | None:
     return _FFMPEG_CACHE
 
 
-def make_ydl_opts(**options):
-    opts = {"quiet": True, **options}
-    ffmpeg_location = _resolve_ffmpeg_location()
-    if ffmpeg_location:
-        opts.setdefault("ffmpeg_location", ffmpeg_location)
+def make_ydl_opts(*, require_ffmpeg: bool = False, **options):
+    opts = {"quiet": True, "cachedir": False, **options}
+    if require_ffmpeg:
+        ffmpeg_location = _resolve_ffmpeg_location()
+        if ffmpeg_location:
+            opts.setdefault("ffmpeg_location", ffmpeg_location)
     return opts
 
 
@@ -120,6 +132,7 @@ def get_podcast_transcript(url: str, audio_format: str = "mp3") -> dict:
     import tempfile, os
     output_dir = tempfile.mkdtemp()
     ydl_opts = make_ydl_opts(
+        require_ffmpeg=True,
         format="bestaudio/best",
         outtmpl=os.path.join(output_dir, "%(title)s.%(ext)s"),
         postprocessors=[{
@@ -294,7 +307,6 @@ def list_formats(url: str) -> list:
 
 
 if __name__ == "__main__":
-    _resolve_ffmpeg_location()
     mcp.run()
 
 
