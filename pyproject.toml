@@ -249,7 +249,7 @@ python = [
 ]
 
 [tool.uv]
-exclude-newer = "7 days"
+exclude-newer = "2025-06-29T00:00:00Z"
 
 [tool.uv.exclude-newer-package]
 protobug = false
