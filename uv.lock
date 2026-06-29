@@ -13,10 +13,6 @@ resolution-markers = [
 [options]
 exclude-newer = "2026-06-22T00:00:00Z"
 
-[options.exclude-newer-package]
-protobug = false
-yt-dlp-ejs = false
-
 [[package]]
 name = "aiofile"
 version = "3.9.0"

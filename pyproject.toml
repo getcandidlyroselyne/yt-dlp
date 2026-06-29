@@ -253,10 +253,6 @@ python = [
 [tool.uv]
 exclude-newer = "2026-06-22T00:00:00Z"
 
-[tool.uv.exclude-newer-package]
-protobug = false
-yt-dlp-ejs = false
-
 [tool.ruff]
 line-length = 120
 
