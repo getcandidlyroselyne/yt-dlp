@@ -43,7 +43,9 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dynamic = ["version"]
-dependencies = []
+dependencies = [
+    "fastmcp>=3.0",
+]
 
 [project.optional-dependencies]
 default = [
