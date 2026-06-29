@@ -1,7 +1,76 @@
+from __future__ import annotations
+
+import os
+import platform
+import shutil
+import stat
+import tarfile
+import tempfile
+import urllib.request
+from pathlib import Path
+
 from fastmcp import FastMCP
 import yt_dlp
 
 mcp = FastMCP("yt-dlp")
+
+_FFMPEG_BUILDS_URL = (
+    "https://github.com/yt-dlp/FFmpeg-Builds/releases/latest/download/"
+    "ffmpeg-master-latest-linux64-gpl.tar.xz"
+)
+_FFMPEG_CACHE: str | None = None
+
+
+def _resolve_ffmpeg_location() -> str | None:
+    """Return ffmpeg directory for yt-dlp, bootstrapping static builds if needed."""
+    global _FFMPEG_CACHE
+    if _FFMPEG_CACHE is not None:
+        return _FFMPEG_CACHE or None
+
+    env_location = os.environ.get("FFMPEG_LOCATION")
+    if env_location:
+        _FFMPEG_CACHE = env_location
+        return env_location
+
+    if shutil.which("ffmpeg") and shutil.which("ffprobe"):
+        _FFMPEG_CACHE = ""
+        return None
+
+    cache_dir = Path(os.environ.get("YTDLP_FFMPEG_DIR", "/tmp/yt-dlp-ffmpeg"))
+    ffmpeg_bin = cache_dir / "ffmpeg"
+    ffprobe_bin = cache_dir / "ffprobe"
+    if ffmpeg_bin.is_file() and ffprobe_bin.is_file():
+        _FFMPEG_CACHE = str(cache_dir)
+        return _FFMPEG_CACHE
+
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+    if system != "linux" or machine not in {"x86_64", "amd64"}:
+        _FFMPEG_CACHE = ""
+        return None
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as tmp:
+        archive = Path(tmp) / "ffmpeg.tar.xz"
+        with urllib.request.urlopen(_FFMPEG_BUILDS_URL, timeout=120) as response:
+            archive.write_bytes(response.read())
+        with tarfile.open(archive, "r:xz") as tar:
+            tar.extractall(tmp, filter="data")
+        build_root = next(Path(tmp).glob("ffmpeg-*-linux64-gpl"))
+        for name, dest in (("ffmpeg", ffmpeg_bin), ("ffprobe", ffprobe_bin)):
+            shutil.copy2(build_root / "bin" / name, dest)
+            dest.chmod(dest.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+    _FFMPEG_CACHE = str(cache_dir)
+    return _FFMPEG_CACHE
+
+
+def make_ydl_opts(**options):
+    opts = {"quiet": True, **options}
+    ffmpeg_location = _resolve_ffmpeg_location()
+    if ffmpeg_location:
+        opts.setdefault("ffmpeg_location", ffmpeg_location)
+    return opts
 
 
 # ─────────────────────────────────────────────
@@ -15,13 +84,12 @@ def get_video_transcript(url: str, language: str = "en") -> dict:
     and summarization. Used for YouTube sources in the AI News Digest pipeline.
     Returns transcript text, title, uploader, and duration.
     """
-    ydl_opts = {
-        "quiet": True,
-        "writesubtitles": True,
-        "writeautomaticsub": True,
-        "subtitleslangs": [language],
-        "skip_download": True,
-    }
+    ydl_opts = make_ydl_opts(
+        writesubtitles=True,
+        writeautomaticsub=True,
+        subtitleslangs=[language],
+        skip_download=True,
+    )
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
         subtitles = info.get("subtitles", {}) or info.get("automatic_captions", {})
@@ -51,15 +119,14 @@ def get_podcast_transcript(url: str, audio_format: str = "mp3") -> dict:
     """
     import tempfile, os
     output_dir = tempfile.mkdtemp()
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "outtmpl": os.path.join(output_dir, "%(title)s.%(ext)s"),
-        "postprocessors": [{
+    ydl_opts = make_ydl_opts(
+        format="bestaudio/best",
+        outtmpl=os.path.join(output_dir, "%(title)s.%(ext)s"),
+        postprocessors=[{
             "key": "FFmpegExtractAudio",
             "preferredcodec": audio_format,
         }],
-        "quiet": True,
-    }
+    )
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         return {
@@ -80,8 +147,7 @@ def get_source_metadata(url: str) -> dict:
     podcast, RSS feed item) without downloading. Used to validate a new
     source before adding it to the approved source list.
     """
-    ydl_opts = {"quiet": True}
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    with yt_dlp.YoutubeDL(make_ydl_opts()) as ydl:
         info = ydl.extract_info(url, download=False)
         return {
             "title": info.get("title"),
@@ -105,11 +171,7 @@ def get_playlist_items(playlist_url: str, max_items: int = 20) -> list:
     Used to monitor video sources (e.g., a YouTube channel) for new
     content during the daily ingestion refresh cycle (4x/day).
     """
-    ydl_opts = {
-        "quiet": True,
-        "extract_flat": True,
-        "playlistend": max_items,
-    }
+    ydl_opts = make_ydl_opts(extract_flat=True, playlistend=max_items)
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(playlist_url, download=False)
         entries = info.get("entries", [])
@@ -133,8 +195,7 @@ def check_transcript_quality(url: str) -> dict:
     the source for admin review. Per project spec: discard/flag sources
     with poor or missing transcripts.
     """
-    ydl_opts = {"quiet": True}
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    with yt_dlp.YoutubeDL(make_ydl_opts()) as ydl:
         info = ydl.extract_info(url, download=False)
         subtitles = info.get("subtitles", {})
         auto_captions = info.get("automatic_captions", {})
@@ -170,7 +231,7 @@ def validate_source(url: str) -> dict:
     availability. Returns a structured report to support the admin
     vetting process (credibility rubric + monitoring context review).
     """
-    ydl_opts = {"quiet": True, "extract_flat": True}
+    ydl_opts = make_ydl_opts(extract_flat=True)
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -215,8 +276,7 @@ def list_formats(url: str) -> list:
     Useful for determining the best ingestion format per source type
     (prefer RSS/clean feeds; use audio for podcasts; video for YouTube).
     """
-    ydl_opts = {"quiet": True}
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    with yt_dlp.YoutubeDL(make_ydl_opts()) as ydl:
         info = ydl.extract_info(url, download=False)
         formats = info.get("formats", [])
         return [
@@ -234,6 +294,7 @@ def list_formats(url: str) -> list:
 
 
 if __name__ == "__main__":
+    _resolve_ffmpeg_location()
     mcp.run()
 
 
@@ -292,13 +353,12 @@ def extract_timestamped_segments(
     """
     import urllib.request, json, re
 
-    ydl_opts = {
-        "quiet": True,
-        "writesubtitles": True,
-        "writeautomaticsub": True,
-        "subtitleslangs": [language],
-        "skip_download": True,
-    }
+    ydl_opts = make_ydl_opts(
+        writesubtitles=True,
+        writeautomaticsub=True,
+        subtitleslangs=[language],
+        skip_download=True,
+    )
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
         title = info.get("title")
