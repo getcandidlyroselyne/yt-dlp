@@ -626,18 +626,25 @@ def transcribe_podcast(url: str, language_code: str = "en-US") -> dict:
 
     import boto3
 
-    # Resolve stream URL — no download, no disk
-    ydl_opts = make_ydl_opts(format="bestaudio/best")
+    # Resolve stream URL — no download, no disk.
+    # Prefer m4a/mp4 (AAC) for widest AWS Transcribe compatibility;
+    # fall back to any audio-only format, then any format.
+    ydl_opts = make_ydl_opts(format="bestaudio[ext=m4a]/bestaudio[ext=mp4]/bestaudio/best")
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
 
     formats = info.get("formats") or []
-    audio_formats = [
-        f for f in formats
-        if f.get("url") and f.get("acodec") != "none"
-        and f.get("vcodec") in (None, "none", "")
-    ]
-    best = audio_formats[-1] if audio_formats else (formats[-1] if formats else {})
+    # Rank: m4a > mp4 > mp3 > everything else, audio-only preferred
+    def _format_rank(f):
+        if not f.get("url") or f.get("acodec") == "none":
+            return -1
+        ext = f.get("ext", "")
+        audio_only = f.get("vcodec") in (None, "none", "")
+        ext_score = {"m4a": 4, "mp4": 3, "mp3": 2}.get(ext, 1)
+        return ext_score * 2 + (1 if audio_only else 0)
+
+    ranked = sorted(formats, key=_format_rank)
+    best = ranked[-1] if ranked else {}
     stream_url = best.get("url")
     audio_ext = best.get("ext", "mp4")
 
@@ -690,8 +697,15 @@ def transcribe_podcast(url: str, language_code: str = "en-US") -> dict:
         if status == "COMPLETED":
             break
         if status == "FAILED":
-            reason = response["TranscriptionJob"].get("FailureReason", "unknown")
-            return {"error": f"AWS Transcribe job failed: {reason}", "url": url}
+            job = response["TranscriptionJob"]
+            reason = job.get("FailureReason", "unknown")
+            return {
+                "error": f"AWS Transcribe job failed: {reason}",
+                "url": url,
+                "audio_format_used": media_format,
+                "audio_ext": audio_ext,
+                "s3_key": audio_s3_key,
+            }
     else:
         return {"error": "Transcription timed out after 10 minutes", "url": url}
 
