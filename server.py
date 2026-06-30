@@ -172,6 +172,7 @@ def get_podcast_transcript(url: str, audio_format: str = "mp3") -> dict:
         require_ffmpeg=True,
         format="bestaudio/best",
         outtmpl=os.path.join(output_dir, "%(title)s.%(ext)s"),
+        restrictfilenames=True,
         postprocessors=[{
             "key": "FFmpegExtractAudio",
             "preferredcodec": audio_format,

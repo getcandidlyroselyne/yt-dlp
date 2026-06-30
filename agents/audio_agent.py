@@ -97,6 +97,7 @@ def _handle_podcast_audio(payload: dict) -> dict:
         "cachedir": False,
         "format": "bestaudio/best",
         "outtmpl": os.path.join(output_dir, "%(title)s.%(ext)s"),
+        "restrictfilenames": True,
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",
