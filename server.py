@@ -608,20 +608,18 @@ def check_duplicate(item_url: str, item_title: str, post_log: list[dict]) -> dic
 
 
 @mcp.tool()
-def transcribe_podcast(url: str, language_code: str = "en-US") -> dict:
+def start_podcast_transcription(url: str, language_code: str = "en-US") -> dict:
     """
-    Transcribe a podcast episode to text with ZERO local disk usage.
-    Resolves the audio stream URL, downloads into memory, uploads directly
-    to S3, then runs AWS Transcribe on the S3 file.
-    Use this instead of get_podcast_transcript when disk space is limited
-    or when you need the actual transcript text (not just an S3 location).
-    Requires S3_BUCKET and AWS credentials. Blocks until transcription completes
-    (up to ~10 minutes for long episodes).
-    Returns transcript text and episode metadata.
+    Start transcribing a podcast episode with ZERO local disk usage.
+    Downloads audio into memory, uploads to S3, and kicks off an AWS
+    Transcribe job — then returns immediately with a job_name.
+    Call get_transcription_result(job_name) after ~2-5 minutes to fetch
+    the completed transcript. This two-step approach works within Lambda
+    time limits. Supports direct MP3/M4A URLs and tracking redirect links
+    (swap.fm, podtrac, simplecast, etc.) as well as YouTube and other
+    yt-dlp supported sources.
     """
     import io
-    import json
-    import time
     import uuid
 
     import boto3
@@ -727,7 +725,8 @@ def transcribe_podcast(url: str, language_code: str = "en-US") -> dict:
         return {"error": f"S3 upload failed: {exc}", "url": url, "step": "s3_upload"}
 
     try:
-        # Step 4: Start AWS Transcribe job
+        # Step 4: Start AWS Transcribe job and return immediately — no polling.
+        # Lambda will time out if we poll here; use get_transcription_result instead.
         transcribe = boto3.client("transcribe", region_name=region)
         job_name = f"podcast-{job_suffix}"
         transcript_s3_key = f"transcripts/{job_name}.json"
@@ -752,55 +751,76 @@ def transcribe_podcast(url: str, language_code: str = "en-US") -> dict:
             "error": f"Failed to start AWS Transcribe job: {exc}",
             "url": url,
             "audio_ext": audio_ext,
-            "media_format": media_format,
             "s3_key": audio_s3_key,
             "step": "start_transcribe",
         }
 
-    try:
-        # Step 5: Poll until the job completes (up to ~10 minutes)
-        for _ in range(120):
-            time.sleep(5)
-            response = transcribe.get_transcription_job(TranscriptionJobName=job_name)
-            status = response["TranscriptionJob"]["TranscriptionJobStatus"]
-            if status == "COMPLETED":
-                break
-            if status == "FAILED":
-                reason = response["TranscriptionJob"].get("FailureReason", "unknown")
-                return {
-                    "error": f"AWS Transcribe job failed: {reason}",
-                    "url": url,
-                    "audio_format_used": media_format,
-                    "audio_ext": audio_ext,
-                    "s3_key": audio_s3_key,
-                    "step": "transcribe_poll",
-                }
-        else:
-            return {"error": "Transcription timed out after 10 minutes", "url": url, "step": "transcribe_poll"}
-
-        # Step 6: Fetch transcript JSON from S3
-        result_obj = s3_client.get_object(Bucket=bucket, Key=transcript_s3_key)
-        transcript_data = json.loads(result_obj["Body"].read())
-        transcript_text = transcript_data["results"]["transcripts"][0]["transcript"]
-    except Exception as exc:
-        return {"error": f"Failed to retrieve transcript: {exc}", "url": url, "step": "fetch_transcript"}
-
-    # Clean up the raw audio file from S3 (transcript JSON is kept)
-    try:
-        s3_client.delete_object(Bucket=bucket, Key=audio_s3_key)
-    except Exception:
-        pass
-
     return {
+        "status": "transcription_started",
+        "job_name": job_name,
         "title": info.get("title"),
         "uploader": info.get("uploader"),
         "duration_seconds": info.get("duration"),
         "upload_date": info.get("upload_date"),
-        "description": (info.get("description") or "")[:500],
-        "transcript": transcript_text,
+        "audio_format": media_format,
         "transcript_s3_key": transcript_s3_key,
         "url": url,
-        "disk_usage": "none — processed entirely in memory",
+        "next_step": "Call get_transcription_result with the job_name in 2-5 minutes.",
+    }
+
+
+@mcp.tool()
+def get_transcription_result(job_name: str) -> dict:
+    """
+    Fetch the result of a transcription job started by start_podcast_transcription.
+    Returns the transcript text if the job is complete, or status if still in progress.
+    Call this 2-5 minutes after start_podcast_transcription returns a job_name.
+    If status is IN_PROGRESS, wait a bit longer and call again.
+    """
+    import json
+
+    import boto3
+
+    region = os.environ.get("AWS_REGION", "us-east-1")
+
+    try:
+        transcribe = boto3.client("transcribe", region_name=region)
+        response = transcribe.get_transcription_job(TranscriptionJobName=job_name)
+        job = response["TranscriptionJob"]
+        status = job["TranscriptionJobStatus"]
+    except Exception as exc:
+        return {"error": f"Could not retrieve job status: {exc}", "job_name": job_name}
+
+    if status == "IN_PROGRESS" or status == "QUEUED":
+        return {
+            "status": status,
+            "job_name": job_name,
+            "message": "Transcription is still running. Call again in 1-2 minutes.",
+        }
+
+    if status == "FAILED":
+        return {
+            "status": "FAILED",
+            "job_name": job_name,
+            "error": job.get("FailureReason", "unknown"),
+        }
+
+    # COMPLETED — fetch the transcript JSON from S3
+    try:
+        bucket = s3_utils.bucket_name()
+        transcript_s3_key = f"transcripts/{job_name}.json"
+        s3_client = boto3.client("s3", region_name=region)
+        result_obj = s3_client.get_object(Bucket=bucket, Key=transcript_s3_key)
+        transcript_data = json.loads(result_obj["Body"].read())
+        transcript_text = transcript_data["results"]["transcripts"][0]["transcript"]
+    except Exception as exc:
+        return {"error": f"Job completed but failed to fetch transcript: {exc}", "job_name": job_name}
+
+    return {
+        "status": "COMPLETED",
+        "job_name": job_name,
+        "transcript": transcript_text,
+        "transcript_s3_key": transcript_s3_key,
     }
 
 
