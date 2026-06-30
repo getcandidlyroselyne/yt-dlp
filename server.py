@@ -626,93 +626,125 @@ def transcribe_podcast(url: str, language_code: str = "en-US") -> dict:
 
     import boto3
 
-    # Resolve stream URL — no download, no disk.
-    # Prefer m4a/mp4 (AAC) for widest AWS Transcribe compatibility;
-    # fall back to any audio-only format, then any format.
-    ydl_opts = make_ydl_opts(format="bestaudio[ext=m4a]/bestaudio[ext=mp4]/bestaudio/best")
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-
-    formats = info.get("formats") or []
-    # Rank: m4a > mp4 > mp3 > everything else, audio-only preferred
-    def _format_rank(f):
-        if not f.get("url") or f.get("acodec") == "none":
-            return -1
-        ext = f.get("ext", "")
-        audio_only = f.get("vcodec") in (None, "none", "")
-        ext_score = {"m4a": 4, "mp4": 3, "mp3": 2}.get(ext, 1)
-        return ext_score * 2 + (1 if audio_only else 0)
-
-    ranked = sorted(formats, key=_format_rank)
-    best = ranked[-1] if ranked else {}
-    stream_url = best.get("url")
-    audio_ext = best.get("ext", "mp4")
-
-    if not stream_url:
-        return {"error": "Could not resolve a direct audio stream URL", "url": url}
-
-    # Download audio into memory — no disk writes
-    req = urllib.request.Request(stream_url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=300) as resp:
-        audio_bytes = io.BytesIO(resp.read())
-
-    # Upload from memory directly to S3
+    audio_s3_key = None
     region = os.environ.get("AWS_REGION", "us-east-1")
-    bucket = s3_utils.bucket_name()
-    job_suffix = str(uuid.uuid4())[:8]
-    safe_title = s3_utils._safe_key(info.get("title") or "podcast")
-    audio_s3_key = f"podcast-audio/{safe_title}-{job_suffix}.{audio_ext}"
 
-    s3_client = boto3.client("s3", region_name=region)
-    audio_bytes.seek(0)
-    s3_client.upload_fileobj(audio_bytes, bucket, audio_s3_key)
-    s3_uri = f"s3://{bucket}/{audio_s3_key}"
+    try:
+        # Step 1: Resolve stream URL — no download, no disk.
+        # Prefer m4a/mp4 (AAC) for widest AWS Transcribe compatibility.
+        ydl_opts = make_ydl_opts(format="bestaudio[ext=m4a]/bestaudio[ext=mp4]/bestaudio/best")
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as exc:
+        return {"error": f"yt-dlp failed to extract info: {exc}", "url": url, "step": "extract_info"}
 
-    # Start AWS Transcribe job using the S3 file
-    transcribe = boto3.client("transcribe", region_name=region)
-    job_name = f"podcast-{job_suffix}"
-    transcript_s3_key = f"transcripts/{job_name}.json"
+    try:
+        formats = info.get("formats") or []
 
-    _media_format_map = {
-        "mp4": "mp4", "m4a": "mp4", "mp3": "mp3",
-        "webm": "webm", "ogg": "ogg", "flac": "flac",
-        "wav": "wav", "amr": "amr",
-    }
-    media_format = _media_format_map.get(audio_ext, "mp4")
+        def _format_rank(f):
+            if not f.get("url") or f.get("acodec") == "none":
+                return -1
+            ext = f.get("ext", "")
+            audio_only = f.get("vcodec") in (None, "none", "")
+            ext_score = {"m4a": 4, "mp4": 3, "mp3": 2}.get(ext, 1)
+            return ext_score * 2 + (1 if audio_only else 0)
 
-    transcribe.start_transcription_job(
-        TranscriptionJobName=job_name,
-        Media={"MediaFileUri": s3_uri},
-        MediaFormat=media_format,
-        LanguageCode=language_code,
-        OutputBucketName=bucket,
-        OutputKey=transcript_s3_key,
-    )
+        ranked = sorted(formats, key=_format_rank)
+        best = ranked[-1] if ranked else {}
+        stream_url = best.get("url")
+        audio_ext = best.get("ext", "mp4")
 
-    # Poll until the job completes (up to ~10 minutes)
-    for _ in range(120):
-        time.sleep(5)
-        response = transcribe.get_transcription_job(TranscriptionJobName=job_name)
-        status = response["TranscriptionJob"]["TranscriptionJobStatus"]
-        if status == "COMPLETED":
-            break
-        if status == "FAILED":
-            job = response["TranscriptionJob"]
-            reason = job.get("FailureReason", "unknown")
-            return {
-                "error": f"AWS Transcribe job failed: {reason}",
-                "url": url,
-                "audio_format_used": media_format,
-                "audio_ext": audio_ext,
-                "s3_key": audio_s3_key,
-            }
-    else:
-        return {"error": "Transcription timed out after 10 minutes", "url": url}
+        if not stream_url:
+            return {"error": "Could not resolve a direct audio stream URL", "url": url, "step": "select_format"}
+    except Exception as exc:
+        return {"error": f"Format selection failed: {exc}", "url": url, "step": "select_format"}
 
-    # Fetch the transcript JSON from S3
-    result_obj = s3_client.get_object(Bucket=bucket, Key=transcript_s3_key)
-    transcript_data = json.loads(result_obj["Body"].read())
-    transcript_text = transcript_data["results"]["transcripts"][0]["transcript"]
+    try:
+        # Step 2: Download audio into memory — no disk writes
+        req = urllib.request.Request(stream_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            audio_bytes = io.BytesIO(resp.read())
+    except Exception as exc:
+        return {
+            "error": f"Failed to download audio stream: {exc}",
+            "url": url,
+            "stream_url": stream_url[:80] + "…",
+            "audio_ext": audio_ext,
+            "step": "download_stream",
+        }
+
+    try:
+        # Step 3: Upload from memory directly to S3
+        bucket = s3_utils.bucket_name()
+        job_suffix = str(uuid.uuid4())[:8]
+        safe_title = s3_utils._safe_key(info.get("title") or "podcast")
+        audio_s3_key = f"podcast-audio/{safe_title}-{job_suffix}.{audio_ext}"
+
+        s3_client = boto3.client("s3", region_name=region)
+        audio_bytes.seek(0)
+        s3_client.upload_fileobj(audio_bytes, bucket, audio_s3_key)
+        s3_uri = f"s3://{bucket}/{audio_s3_key}"
+    except Exception as exc:
+        return {"error": f"S3 upload failed: {exc}", "url": url, "step": "s3_upload"}
+
+    try:
+        # Step 4: Start AWS Transcribe job
+        transcribe = boto3.client("transcribe", region_name=region)
+        job_name = f"podcast-{job_suffix}"
+        transcript_s3_key = f"transcripts/{job_name}.json"
+
+        _media_format_map = {
+            "mp4": "mp4", "m4a": "mp4", "mp3": "mp3",
+            "webm": "webm", "ogg": "ogg", "flac": "flac",
+            "wav": "wav", "amr": "amr",
+        }
+        media_format = _media_format_map.get(audio_ext, "mp4")
+
+        transcribe.start_transcription_job(
+            TranscriptionJobName=job_name,
+            Media={"MediaFileUri": s3_uri},
+            MediaFormat=media_format,
+            LanguageCode=language_code,
+            OutputBucketName=bucket,
+            OutputKey=transcript_s3_key,
+        )
+    except Exception as exc:
+        return {
+            "error": f"Failed to start AWS Transcribe job: {exc}",
+            "url": url,
+            "audio_ext": audio_ext,
+            "media_format": media_format,
+            "s3_key": audio_s3_key,
+            "step": "start_transcribe",
+        }
+
+    try:
+        # Step 5: Poll until the job completes (up to ~10 minutes)
+        for _ in range(120):
+            time.sleep(5)
+            response = transcribe.get_transcription_job(TranscriptionJobName=job_name)
+            status = response["TranscriptionJob"]["TranscriptionJobStatus"]
+            if status == "COMPLETED":
+                break
+            if status == "FAILED":
+                reason = response["TranscriptionJob"].get("FailureReason", "unknown")
+                return {
+                    "error": f"AWS Transcribe job failed: {reason}",
+                    "url": url,
+                    "audio_format_used": media_format,
+                    "audio_ext": audio_ext,
+                    "s3_key": audio_s3_key,
+                    "step": "transcribe_poll",
+                }
+        else:
+            return {"error": "Transcription timed out after 10 minutes", "url": url, "step": "transcribe_poll"}
+
+        # Step 6: Fetch transcript JSON from S3
+        result_obj = s3_client.get_object(Bucket=bucket, Key=transcript_s3_key)
+        transcript_data = json.loads(result_obj["Body"].read())
+        transcript_text = transcript_data["results"]["transcripts"][0]["transcript"]
+    except Exception as exc:
+        return {"error": f"Failed to retrieve transcript: {exc}", "url": url, "step": "fetch_transcript"}
 
     # Clean up the raw audio file from S3 (transcript JSON is kept)
     try:
