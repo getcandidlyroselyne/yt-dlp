@@ -48,8 +48,8 @@ _LLM = ChatOpenAI(model="gpt-4o", temperature=0)
 
 # Tool subsets each agent is allowed to use
 _INGESTION_TOOLS = {"validate_source", "get_source_metadata", "get_playlist_items", "list_formats"}
-_TRANSCRIPT_TOOLS = {"get_video_transcript", "get_podcast_transcript", "check_transcript_quality",
-                     "extract_timestamped_segments"}
+_TRANSCRIPT_TOOLS = {"get_video_transcript", "get_podcast_stream_url", "get_podcast_transcript",
+                     "check_transcript_quality", "extract_timestamped_segments"}
 _DIGEST_TOOLS = {"keyword_filter", "score_relevance", "format_digest_item",
                  "build_digest", "check_duplicate"}
 
@@ -74,10 +74,15 @@ _TRANSCRIPT_SYSTEM = """
 You are the Transcript Agent in the AI News Digest fleet.
 Your job is to extract transcripts and assess transcript quality for each media source.
 Use check_transcript_quality first to determine if a source is worth ingesting.
-If quality is 'ingest' or 'ingest_with_caution', call get_video_transcript (for video)
-or get_podcast_transcript (for audio) to retrieve the transcript URL and metadata.
+If quality is 'ingest' or 'ingest_with_caution':
+  - For YouTube videos: call get_video_transcript — it uses no disk space.
+  - For podcasts: call get_podcast_stream_url — it returns a direct audio stream URL
+    with zero disk usage. Pass that stream_url to your transcription service (Whisper etc.)
+    without saving the file to disk. Only fall back to get_podcast_transcript if you
+    explicitly need a local file and you have confirmed disk space is available.
 Use extract_timestamped_segments when timestamped bullets are required.
-Always report has_transcript, recommended_action, and transcript_url in your output.
+Always report has_transcript, recommended_action, and stream_url or transcript_url in your output.
+Never call get_podcast_transcript when disk space may be limited.
 """.strip()
 
 _DIGEST_SYSTEM = """

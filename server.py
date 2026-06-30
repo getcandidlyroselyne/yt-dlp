@@ -123,10 +123,46 @@ def get_video_transcript(url: str, language: str = "en") -> dict:
 
 
 @mcp.tool()
+def get_podcast_stream_url(url: str) -> dict:
+    """
+    Resolve the direct audio stream URL for a podcast episode without downloading
+    or writing any files to disk. Zero disk space used.
+    Pass the returned stream_url directly to a transcription service (e.g. Whisper API).
+    Use this instead of get_podcast_transcript whenever disk space is limited.
+    Returns: stream_url, title, uploader, duration_seconds, upload_date, description.
+    """
+    ydl_opts = make_ydl_opts(format="bestaudio/best")
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        formats = info.get("formats") or []
+        # Pick the best audio-only format with a direct URL
+        audio_formats = [
+            f for f in formats
+            if f.get("url") and f.get("acodec") != "none"
+            and f.get("vcodec") in (None, "none", "")
+        ]
+        best = audio_formats[-1] if audio_formats else (formats[-1] if formats else {})
+        return {
+            "title": info.get("title"),
+            "uploader": info.get("uploader"),
+            "duration_seconds": info.get("duration"),
+            "upload_date": info.get("upload_date"),
+            "description": (info.get("description") or "")[:500],
+            "stream_url": best.get("url"),
+            "audio_ext": best.get("ext"),
+            "filesize_bytes": best.get("filesize") or best.get("filesize_approx"),
+            "source_url": url,
+            "disk_usage": "none — stream directly from stream_url, do not download",
+        }
+
+
+@mcp.tool()
 def get_podcast_transcript(url: str, audio_format: str = "mp3") -> dict:
     """
-    Download a podcast episode audio file for transcript generation.
-    Used for podcast sources in the AI News Digest ingestion pipeline.
+    Download a podcast episode audio file to disk for transcript generation.
+    WARNING: requires free disk space equal to the episode size.
+    If disk space is limited, use get_podcast_stream_url instead and send
+    the stream_url directly to your transcription service without saving to disk.
     Returns file path and episode metadata.
     """
     output_dir = tempfile.mkdtemp()
