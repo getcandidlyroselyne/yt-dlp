@@ -629,16 +629,20 @@ def transcribe_podcast(url: str, language_code: str = "en-US") -> dict:
     audio_s3_key = None
     region = os.environ.get("AWS_REGION", "us-east-1")
 
+    # Step 1: Resolve the final audio stream URL and episode metadata.
+    # First try yt-dlp (handles YouTube, Spotify, Apple Podcasts, etc.).
+    # If yt-dlp doesn't recognise the URL (e.g. tracking redirect links
+    # like swap.fm/podtrac/simplecast), fall back to following HTTP
+    # redirects directly to the raw audio file.
+    info: dict = {}
+    stream_url: str | None = None
+    audio_ext = "mp3"
+
     try:
-        # Step 1: Resolve stream URL — no download, no disk.
-        # Prefer m4a/mp4 (AAC) for widest AWS Transcribe compatibility.
         ydl_opts = make_ydl_opts(format="bestaudio[ext=m4a]/bestaudio[ext=mp4]/bestaudio/best")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-    except Exception as exc:
-        return {"error": f"yt-dlp failed to extract info: {exc}", "url": url, "step": "extract_info"}
 
-    try:
         formats = info.get("formats") or []
 
         def _format_rank(f):
@@ -653,11 +657,46 @@ def transcribe_podcast(url: str, language_code: str = "en-US") -> dict:
         best = ranked[-1] if ranked else {}
         stream_url = best.get("url")
         audio_ext = best.get("ext", "mp4")
+    except Exception:
+        pass  # fall through to direct-URL path
 
-        if not stream_url:
-            return {"error": "Could not resolve a direct audio stream URL", "url": url, "step": "select_format"}
-    except Exception as exc:
-        return {"error": f"Format selection failed: {exc}", "url": url, "step": "select_format"}
+    # Fallback: treat the URL as a direct/redirect audio link.
+    # Follow redirects to find the real file URL and infer its format.
+    if not stream_url:
+        try:
+            req = urllib.request.Request(
+                url,
+                method="HEAD",
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                final_url = resp.url
+                content_type = resp.headers.get("Content-Type", "")
+
+            stream_url = final_url
+            # Infer extension from the resolved URL or Content-Type
+            _ct_map = {
+                "audio/mpeg": "mp3", "audio/mp4": "mp4",
+                "audio/x-m4a": "mp4", "audio/ogg": "ogg",
+                "audio/flac": "flac", "audio/wav": "wav",
+                "audio/webm": "webm",
+            }
+            audio_ext = _ct_map.get(content_type.split(";")[0].strip(), "mp3")
+            if audio_ext == "mp3" and ".mp3" not in final_url and ".m4a" in final_url:
+                audio_ext = "mp4"
+
+            info = {"title": None, "uploader": None, "duration": None,
+                    "upload_date": None, "description": None}
+        except Exception as exc:
+            return {
+                "error": f"Could not resolve audio URL (yt-dlp and direct fallback both failed): {exc}",
+                "url": url,
+                "step": "resolve_url",
+                "hint": "Provide the episode page URL (e.g. the podcast website or Apple Podcasts link), not a tracking/redirect MP3 link.",
+            }
+
+    if not stream_url:
+        return {"error": "Could not resolve a direct audio stream URL", "url": url, "step": "select_format"}
 
     try:
         # Step 2: Download audio into memory — no disk writes
