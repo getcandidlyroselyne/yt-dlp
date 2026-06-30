@@ -13,7 +13,7 @@ from pathlib import Path
 from fastmcp import FastMCP
 import yt_dlp
 
-import gcs_utils
+import s3_utils
 
 mcp = FastMCP("yt-dlp")
 
@@ -161,11 +161,11 @@ def get_podcast_stream_url(url: str) -> dict:
 @mcp.tool()
 def get_podcast_transcript(url: str, audio_format: str = "mp3") -> dict:
     """
-    Extract audio from a podcast episode, upload it directly to Google Cloud
-    Storage, and return the GCS location for downstream transcription.
+    Extract audio from a podcast episode, upload it directly to S3,
+    and return the S3 location for downstream transcription.
     No audio content is retained on local disk after the upload completes.
-    Requires the GCS_BUCKET environment variable and appropriate GCS credentials.
-    Returns gcs_uri, gcs_download_url, and episode metadata.
+    Requires the S3_BUCKET environment variable and AWS credentials.
+    Returns s3_uri, s3_download_url, and episode metadata.
     """
     output_dir = tempfile.mkdtemp()
     ydl_opts = make_ydl_opts(
@@ -180,7 +180,7 @@ def get_podcast_transcript(url: str, audio_format: str = "mp3") -> dict:
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
 
-    gcs = gcs_utils.upload_audio_and_cleanup(
+    s3 = s3_utils.upload_audio_and_cleanup(
         output_dir=output_dir,
         title=info.get("title") or "",
         audio_format=audio_format,
@@ -192,9 +192,9 @@ def get_podcast_transcript(url: str, audio_format: str = "mp3") -> dict:
         "duration_seconds": info.get("duration"),
         "upload_date": info.get("upload_date"),
         "description": (info.get("description") or "")[:500],
-        "gcs_uri": gcs["gcs_uri"],
-        "gcs_download_url": gcs["gcs_download_url"],
-        "gcs_object": gcs["gcs_object"],
+        "s3_uri": s3["s3_uri"],
+        "s3_download_url": s3["s3_download_url"],
+        "s3_key": s3["s3_key"],
         "url": url,
     }
 
