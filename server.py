@@ -607,5 +607,117 @@ def check_duplicate(item_url: str, item_title: str, post_log: list[dict]) -> dic
     return {"is_duplicate": False, "recommendation": "include", "url": item_url, "title": item_title}
 
 
+@mcp.tool()
+def transcribe_podcast(url: str, language_code: str = "en-US") -> dict:
+    """
+    Transcribe a podcast episode to text with ZERO local disk usage.
+    Resolves the audio stream URL, downloads into memory, uploads directly
+    to S3, then runs AWS Transcribe on the S3 file.
+    Use this instead of get_podcast_transcript when disk space is limited
+    or when you need the actual transcript text (not just an S3 location).
+    Requires S3_BUCKET and AWS credentials. Blocks until transcription completes
+    (up to ~10 minutes for long episodes).
+    Returns transcript text and episode metadata.
+    """
+    import io
+    import json
+    import time
+    import uuid
+
+    import boto3
+
+    # Resolve stream URL — no download, no disk
+    ydl_opts = make_ydl_opts(format="bestaudio/best")
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+
+    formats = info.get("formats") or []
+    audio_formats = [
+        f for f in formats
+        if f.get("url") and f.get("acodec") != "none"
+        and f.get("vcodec") in (None, "none", "")
+    ]
+    best = audio_formats[-1] if audio_formats else (formats[-1] if formats else {})
+    stream_url = best.get("url")
+    audio_ext = best.get("ext", "mp4")
+
+    if not stream_url:
+        return {"error": "Could not resolve a direct audio stream URL", "url": url}
+
+    # Download audio into memory — no disk writes
+    req = urllib.request.Request(stream_url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        audio_bytes = io.BytesIO(resp.read())
+
+    # Upload from memory directly to S3
+    region = os.environ.get("AWS_REGION", "us-east-1")
+    bucket = s3_utils.bucket_name()
+    job_suffix = str(uuid.uuid4())[:8]
+    safe_title = s3_utils._safe_key(info.get("title") or "podcast")
+    audio_s3_key = f"podcast-audio/{safe_title}-{job_suffix}.{audio_ext}"
+
+    s3_client = boto3.client("s3", region_name=region)
+    audio_bytes.seek(0)
+    s3_client.upload_fileobj(audio_bytes, bucket, audio_s3_key)
+    s3_uri = f"s3://{bucket}/{audio_s3_key}"
+
+    # Start AWS Transcribe job using the S3 file
+    transcribe = boto3.client("transcribe", region_name=region)
+    job_name = f"podcast-{job_suffix}"
+    transcript_s3_key = f"transcripts/{job_name}.json"
+
+    _media_format_map = {
+        "mp4": "mp4", "m4a": "mp4", "mp3": "mp3",
+        "webm": "webm", "ogg": "ogg", "flac": "flac",
+        "wav": "wav", "amr": "amr",
+    }
+    media_format = _media_format_map.get(audio_ext, "mp4")
+
+    transcribe.start_transcription_job(
+        TranscriptionJobName=job_name,
+        Media={"MediaFileUri": s3_uri},
+        MediaFormat=media_format,
+        LanguageCode=language_code,
+        OutputBucketName=bucket,
+        OutputKey=transcript_s3_key,
+    )
+
+    # Poll until the job completes (up to ~10 minutes)
+    for _ in range(120):
+        time.sleep(5)
+        response = transcribe.get_transcription_job(TranscriptionJobName=job_name)
+        status = response["TranscriptionJob"]["TranscriptionJobStatus"]
+        if status == "COMPLETED":
+            break
+        if status == "FAILED":
+            reason = response["TranscriptionJob"].get("FailureReason", "unknown")
+            return {"error": f"AWS Transcribe job failed: {reason}", "url": url}
+    else:
+        return {"error": "Transcription timed out after 10 minutes", "url": url}
+
+    # Fetch the transcript JSON from S3
+    result_obj = s3_client.get_object(Bucket=bucket, Key=transcript_s3_key)
+    transcript_data = json.loads(result_obj["Body"].read())
+    transcript_text = transcript_data["results"]["transcripts"][0]["transcript"]
+
+    # Clean up the raw audio file from S3 (transcript JSON is kept)
+    try:
+        s3_client.delete_object(Bucket=bucket, Key=audio_s3_key)
+    except Exception:
+        pass
+
+    return {
+        "title": info.get("title"),
+        "uploader": info.get("uploader"),
+        "duration_seconds": info.get("duration"),
+        "upload_date": info.get("upload_date"),
+        "description": (info.get("description") or "")[:500],
+        "transcript": transcript_text,
+        "transcript_s3_key": transcript_s3_key,
+        "url": url,
+        "disk_usage": "none — processed entirely in memory",
+    }
+
+
 if __name__ == "__main__":
     mcp.run()
