@@ -49,6 +49,7 @@ dependencies = [
     "langchain-openai>=0.2",
     "langchain-mcp-adapters>=0.1",
     "langgraph>=0.2",
+    "google-cloud-storage>=2.0",
 ]
 
 [project.optional-dependencies]

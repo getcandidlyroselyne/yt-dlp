@@ -13,6 +13,8 @@ from pathlib import Path
 from fastmcp import FastMCP
 import yt_dlp
 
+import gcs_utils
+
 mcp = FastMCP("yt-dlp")
 
 _FFMPEG_BUILDS_URL = (
@@ -159,11 +161,11 @@ def get_podcast_stream_url(url: str) -> dict:
 @mcp.tool()
 def get_podcast_transcript(url: str, audio_format: str = "mp3") -> dict:
     """
-    Download a podcast episode audio file to disk for transcript generation.
-    WARNING: requires free disk space equal to the episode size.
-    If disk space is limited, use get_podcast_stream_url instead and send
-    the stream_url directly to your transcription service without saving to disk.
-    Returns file path and episode metadata.
+    Extract audio from a podcast episode, upload it directly to Google Cloud
+    Storage, and return the GCS location for downstream transcription.
+    No audio content is retained on local disk after the upload completes.
+    Requires the GCS_BUCKET environment variable and appropriate GCS credentials.
+    Returns gcs_uri, gcs_download_url, and episode metadata.
     """
     output_dir = tempfile.mkdtemp()
     ydl_opts = make_ydl_opts(
@@ -177,15 +179,24 @@ def get_podcast_transcript(url: str, audio_format: str = "mp3") -> dict:
     )
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
-        return {
-            "title": info.get("title"),
-            "uploader": info.get("uploader"),
-            "duration_seconds": info.get("duration"),
-            "upload_date": info.get("upload_date"),
-            "description": (info.get("description") or "")[:500],
-            "output_dir": output_dir,
-            "url": url,
-        }
+
+    gcs = gcs_utils.upload_audio_and_cleanup(
+        output_dir=output_dir,
+        title=info.get("title") or "",
+        audio_format=audio_format,
+    )
+
+    return {
+        "title": info.get("title"),
+        "uploader": info.get("uploader"),
+        "duration_seconds": info.get("duration"),
+        "upload_date": info.get("upload_date"),
+        "description": (info.get("description") or "")[:500],
+        "gcs_uri": gcs["gcs_uri"],
+        "gcs_download_url": gcs["gcs_download_url"],
+        "gcs_object": gcs["gcs_object"],
+        "url": url,
+    }
 
 
 @mcp.tool()

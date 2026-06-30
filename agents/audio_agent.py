@@ -25,6 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import gcs_utils
 import job_store
 import yt_dlp
 
@@ -111,13 +112,21 @@ def _handle_podcast_audio(payload: dict) -> dict:
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
 
+    gcs = gcs_utils.upload_audio_and_cleanup(
+        output_dir=output_dir,
+        title=info.get("title") or "",
+        audio_format=audio_format,
+    )
+
     return {
         "title": info.get("title"),
         "uploader": info.get("uploader"),
         "duration_seconds": info.get("duration"),
         "upload_date": info.get("upload_date"),
         "description": (info.get("description") or "")[:500],
-        "output_dir": output_dir,
+        "gcs_uri": gcs["gcs_uri"],
+        "gcs_download_url": gcs["gcs_download_url"],
+        "gcs_object": gcs["gcs_object"],
         "audio_format": audio_format,
         "url": url,
     }
