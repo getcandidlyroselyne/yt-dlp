@@ -45,6 +45,10 @@ classifiers = [
 dynamic = ["version"]
 dependencies = [
     "fastmcp>=3.0",
+    "langchain>=0.3",
+    "langchain-openai>=0.2",
+    "langchain-mcp-adapters>=0.1",
+    "langgraph>=0.2",
 ]
 
 [project.optional-dependencies]

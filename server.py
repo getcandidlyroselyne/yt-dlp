@@ -11,8 +11,7 @@ import urllib.request
 from pathlib import Path
 
 from fastmcp import FastMCP
-
-import job_store
+import yt_dlp
 
 mcp = FastMCP("yt-dlp")
 
@@ -31,7 +30,6 @@ def _disk_free_mb(path: Path) -> float:
 
 
 def _resolve_ffmpeg_location() -> str | None:
-    """Return ffmpeg directory for yt-dlp, bootstrapping static builds if needed."""
     global _FFMPEG_CACHE
     if _FFMPEG_CACHE is not None:
         return _FFMPEG_CACHE or None
@@ -78,149 +76,153 @@ def _resolve_ffmpeg_location() -> str | None:
     return _FFMPEG_CACHE
 
 
-# ─────────────────────────────────────────────
-# Job Queue — Coordination tools for agents
-# ─────────────────────────────────────────────
-
-@mcp.tool()
-def get_job_status(job_id: str) -> dict:
-    """
-    Check the status of an async job submitted to the fleet.
-    Poll this after calling any ingestion tool until status is 'done' or 'failed'.
-    Returns the full job record including result when complete.
-    """
-    job = job_store.get_job(job_id)
-    if not job:
-        return {"error": f"Job {job_id!r} not found", "status": "unknown"}
-    return job
-
-
-@mcp.tool()
-def list_queued_jobs(status: str = "") -> list:
-    """
-    List all jobs in the fleet queue.
-    Pass status='queued', 'running', 'done', or 'failed' to filter.
-    Useful for monitoring fleet health and diagnosing stuck jobs.
-    """
-    return job_store.list_jobs(status or None)
-
-
-@mcp.tool()
-def purge_completed_jobs(older_than_seconds: int = 3600) -> dict:
-    """
-    Remove completed and failed jobs older than the given age in seconds.
-    Call periodically to keep the job store clean. Default: 1 hour.
-    """
-    purged = job_store.purge_done(older_than_seconds)
-    return {"purged": purged, "older_than_seconds": older_than_seconds}
-
-
-@mcp.tool()
-def retry_failed_job(job_id: str) -> dict:
-    """
-    Manually requeue a failed job for another attempt by the fleet.
-    Use this when a job failed due to a transient error (rate limit, network).
-    """
-    job = job_store.get_job(job_id)
-    if not job:
-        return {"error": f"Job {job_id!r} not found"}
-    if job["status"] != "failed":
-        return {"error": f"Job {job_id!r} is {job['status']!r}, not 'failed'"}
-    job_store.requeue_failed(job_id, max_attempts=99)
-    return {"job_id": job_id, "status": "requeued"}
+def make_ydl_opts(*, require_ffmpeg: bool = False, **options) -> dict:
+    opts = {"quiet": True, "cachedir": False, **options}
+    if require_ffmpeg:
+        ffmpeg_location = _resolve_ffmpeg_location()
+        if ffmpeg_location:
+            opts.setdefault("ffmpeg_location", ffmpeg_location)
+    return opts
 
 
 # ─────────────────────────────────────────────
 # Workstream B: Ingestion & Normalization
-# All tools below enqueue work to the agent fleet — no blocking I/O here.
 # ─────────────────────────────────────────────
 
 @mcp.tool()
 def get_video_transcript(url: str, language: str = "en") -> dict:
     """
-    Queue extraction of a video transcript/subtitles for filtering and summarization.
-    Used for YouTube sources in the AI News Digest pipeline.
-    Returns immediately with a job_id. Poll get_job_status(job_id) until done.
-    Result will contain: title, uploader, duration_seconds, upload_date, transcript_url, has_transcript.
+    Download a video and extract its transcript/subtitles for filtering
+    and summarization. Used for YouTube sources in the AI News Digest pipeline.
+    Returns transcript text, title, uploader, and duration.
     """
-    job_id = job_store.enqueue("video_transcript", {"url": url, "language": language})
-    return {
-        "job_id": job_id,
-        "status": "queued",
-        "url": url,
-        "language": language,
-        "note": "Poll get_job_status(job_id) every 10s until status is 'done'.",
-    }
+    ydl_opts = make_ydl_opts(
+        writesubtitles=True,
+        writeautomaticsub=True,
+        subtitleslangs=[language],
+        skip_download=True,
+    )
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        subtitles = info.get("subtitles", {}) or info.get("automatic_captions", {})
+        transcript_url = None
+        if language in subtitles:
+            for fmt in subtitles[language]:
+                if fmt.get("ext") in ("vtt", "srv3", "json3"):
+                    transcript_url = fmt.get("url")
+                    break
+        return {
+            "title": info.get("title"),
+            "uploader": info.get("uploader"),
+            "duration_seconds": info.get("duration"),
+            "upload_date": info.get("upload_date"),
+            "url": url,
+            "transcript_url": transcript_url,
+            "has_transcript": transcript_url is not None,
+        }
 
 
 @mcp.tool()
 def get_podcast_transcript(url: str, audio_format: str = "mp3") -> dict:
     """
-    Queue download of a podcast episode audio file for transcript generation.
+    Download a podcast episode audio file for transcript generation.
     Used for podcast sources in the AI News Digest ingestion pipeline.
-    Returns immediately with a job_id. Poll get_job_status(job_id) until done.
-    Result will contain: title, uploader, duration_seconds, output_dir.
+    Returns file path and episode metadata.
     """
-    job_id = job_store.enqueue("podcast_audio", {"url": url, "audio_format": audio_format})
-    return {
-        "job_id": job_id,
-        "status": "queued",
-        "url": url,
-        "audio_format": audio_format,
-        "note": "Poll get_job_status(job_id) every 10s until status is 'done'.",
-    }
+    output_dir = tempfile.mkdtemp()
+    ydl_opts = make_ydl_opts(
+        require_ffmpeg=True,
+        format="bestaudio/best",
+        outtmpl=os.path.join(output_dir, "%(title)s.%(ext)s"),
+        postprocessors=[{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": audio_format,
+        }],
+    )
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        return {
+            "title": info.get("title"),
+            "uploader": info.get("uploader"),
+            "duration_seconds": info.get("duration"),
+            "upload_date": info.get("upload_date"),
+            "description": (info.get("description") or "")[:500],
+            "output_dir": output_dir,
+            "url": url,
+        }
 
 
 @mcp.tool()
 def get_source_metadata(url: str) -> dict:
     """
-    Queue metadata extraction from any yt-dlp supported source without downloading.
+    Extract metadata from any yt-dlp supported source without downloading.
     Used to validate a new source before adding it to the approved source list.
-    Returns immediately with a job_id. Poll get_job_status(job_id) until done.
-    Result will contain: title, uploader, upload_date, duration_seconds, view_count, etc.
     """
-    job_id = job_store.enqueue("source_metadata", {"url": url})
-    return {
-        "job_id": job_id,
-        "status": "queued",
-        "url": url,
-        "note": "Poll get_job_status(job_id) every 10s until status is 'done'.",
-    }
+    with yt_dlp.YoutubeDL(make_ydl_opts()) as ydl:
+        info = ydl.extract_info(url, download=False)
+        return {
+            "title": info.get("title"),
+            "uploader": info.get("uploader"),
+            "upload_date": info.get("upload_date"),
+            "duration_seconds": info.get("duration"),
+            "view_count": info.get("view_count"),
+            "like_count": info.get("like_count"),
+            "description": (info.get("description") or "")[:800],
+            "webpage_url": info.get("webpage_url"),
+            "extractor": info.get("extractor"),
+            "is_live": info.get("is_live", False),
+            "availability": info.get("availability"),
+        }
 
 
 @mcp.tool()
-def get_playlist_items(playlist_url: str, max_items: int = 20) -> dict:
+def get_playlist_items(playlist_url: str, max_items: int = 20) -> list:
     """
-    Queue fetching of all video/episode entries from a YouTube playlist or channel.
+    Fetch all video/episode entries from a YouTube playlist or channel.
     Used to monitor video sources for new content during the daily ingestion refresh.
-    Returns immediately with a job_id. Poll get_job_status(job_id) until done.
-    Result will be a list of: title, url, upload_date, duration_seconds, id.
     """
-    job_id = job_store.enqueue("playlist_items", {"url": playlist_url, "max_items": max_items})
-    return {
-        "job_id": job_id,
-        "status": "queued",
-        "url": playlist_url,
-        "max_items": max_items,
-        "note": "Poll get_job_status(job_id) every 10s until status is 'done'.",
-    }
+    ydl_opts = make_ydl_opts(extract_flat=True, playlistend=max_items)
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(playlist_url, download=False)
+        entries = info.get("entries", [])
+        return [
+            {
+                "title": e.get("title"),
+                "url": e.get("url") or e.get("webpage_url"),
+                "upload_date": e.get("upload_date"),
+                "duration_seconds": e.get("duration"),
+                "id": e.get("id"),
+            }
+            for e in entries if e
+        ]
 
 
 @mcp.tool()
 def check_transcript_quality(url: str) -> dict:
     """
-    Queue a check of whether a video/podcast source has a usable transcript.
+    Check whether a video/podcast source has a usable transcript.
     Returns quality indicators to decide whether to ingest or flag for admin review.
-    Returns immediately with a job_id. Poll get_job_status(job_id) until done.
-    Result will contain: has_manual_transcript, has_auto_transcript, recommended_action.
     """
-    job_id = job_store.enqueue("transcript_quality", {"url": url})
-    return {
-        "job_id": job_id,
-        "status": "queued",
-        "url": url,
-        "note": "Poll get_job_status(job_id) every 10s until status is 'done'.",
-    }
+    with yt_dlp.YoutubeDL(make_ydl_opts()) as ydl:
+        info = ydl.extract_info(url, download=False)
+        subtitles = info.get("subtitles", {})
+        auto_captions = info.get("automatic_captions", {})
+        has_manual = bool(subtitles)
+        has_auto = bool(auto_captions)
+        return {
+            "title": info.get("title"),
+            "has_manual_transcript": has_manual,
+            "has_auto_transcript": has_auto,
+            "has_any_transcript": has_manual or has_auto,
+            "manual_transcript_languages": list(subtitles.keys()),
+            "auto_transcript_languages": list(auto_captions.keys()),
+            "recommended_action": (
+                "ingest" if has_manual
+                else "ingest_with_caution" if has_auto
+                else "flag_for_admin"
+            ),
+            "duration_seconds": info.get("duration"),
+        }
 
 
 # ─────────────────────────────────────────────
@@ -230,40 +232,72 @@ def check_transcript_quality(url: str) -> dict:
 @mcp.tool()
 def validate_source(url: str) -> dict:
     """
-    Queue validation of a candidate source URL before adding to the approved source list.
+    Validate a candidate source URL before adding it to the approved source list.
     Checks reachability, source type, and transcript availability.
-    Returns immediately with a job_id. Poll get_job_status(job_id) until done.
-    Result will contain: reachable, source_type, extractor, title, item_count, suggested_schema_fields.
     """
-    job_id = job_store.enqueue("validate_source", {"url": url})
-    return {
-        "job_id": job_id,
-        "status": "queued",
-        "url": url,
-        "note": "Poll get_job_status(job_id) every 10s until status is 'done'.",
-    }
+    ydl_opts = make_ydl_opts(extract_flat=True)
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            extractor = info.get("extractor", "unknown")
+            is_playlist = info.get("_type") == "playlist"
+            entries = info.get("entries", [])
+            return {
+                "url": url,
+                "reachable": True,
+                "source_type": (
+                    "playlist_or_channel" if is_playlist
+                    else "single_video" if extractor in ("youtube", "vimeo")
+                    else "podcast_or_audio" if extractor in ("soundcloud", "buzzsprout", "simplecast")
+                    else "article_or_rss"
+                ),
+                "extractor": extractor,
+                "title": info.get("title"),
+                "uploader": info.get("uploader"),
+                "item_count": len(entries) if is_playlist else 1,
+                "suggested_schema_fields": {
+                    "source_link": url,
+                    "monitoring_contexts": [],
+                    "why_it_matters": "",
+                    "cadence": info.get("upload_frequency", "unknown"),
+                    "last_successful_fetch": None,
+                    "error_state": None,
+                },
+            }
+    except Exception as e:
+        return {
+            "url": url,
+            "reachable": False,
+            "error": str(e),
+            "recommended_action": "do_not_add",
+        }
 
 
 @mcp.tool()
-def list_formats(url: str) -> dict:
+def list_formats(url: str) -> list:
     """
-    Queue listing of all available media formats for a given URL.
+    List all available media formats for a given URL.
     Useful for determining the best ingestion format per source type.
-    Returns immediately with a job_id. Poll get_job_status(job_id) until done.
-    Result will be a list of format dicts: format_id, ext, resolution, filesize, vcodec, acodec.
     """
-    job_id = job_store.enqueue("list_formats", {"url": url})
-    return {
-        "job_id": job_id,
-        "status": "queued",
-        "url": url,
-        "note": "Poll get_job_status(job_id) every 10s until status is 'done'.",
-    }
+    with yt_dlp.YoutubeDL(make_ydl_opts()) as ydl:
+        info = ydl.extract_info(url, download=False)
+        formats = info.get("formats", [])
+        return [
+            {
+                "format_id": f.get("format_id"),
+                "ext": f.get("ext"),
+                "resolution": f.get("resolution"),
+                "filesize": f.get("filesize"),
+                "vcodec": f.get("vcodec"),
+                "acodec": f.get("acodec"),
+                "tbr": f.get("tbr"),
+            }
+            for f in formats
+        ]
 
 
 # ─────────────────────────────────────────────
 # Workstream C: Filtering, Summarization & Slack Output
-# These are pure-compute — no I/O, run inline synchronously.
 # ─────────────────────────────────────────────
 
 @mcp.tool()
@@ -274,9 +308,7 @@ def keyword_filter(
 ) -> dict:
     """
     Phase 1 of the two-pass filtering strategy: keyword match.
-    Scans transcript/article text for any of the provided keywords
-    tied to the source's monitoring context. Returns matched keywords,
-    match count, and whether to proceed to LLM judgment pass.
+    Scans transcript/article text for any of the provided keywords.
     Per project spec: always run LLM pass even if no keywords match.
     """
     text_lower = text.lower()
@@ -308,21 +340,67 @@ def extract_timestamped_segments(
     max_segments: int = 10,
 ) -> dict:
     """
-    Queue extraction of timestamped subtitle segments from a video/podcast.
-    Used to produce timestamp-anchored bullets in the digest
-    (e.g. '[~3:20] Sourdough commands 40% price premium').
-    Returns immediately with a job_id. Poll get_job_status(job_id) until done.
+    Extract timestamped subtitle segments from a video/podcast.
+    Every podcast/video bullet must include a timestamp per project spec.
     """
-    job_id = job_store.enqueue(
-        "video_transcript",
-        {"url": url, "language": language, "max_segments": max_segments, "timestamped": True},
+    import json
+
+    ydl_opts = make_ydl_opts(
+        writesubtitles=True,
+        writeautomaticsub=True,
+        subtitleslangs=[language],
+        skip_download=True,
     )
-    return {
-        "job_id": job_id,
-        "status": "queued",
-        "url": url,
-        "note": "Poll get_job_status(job_id) every 10s until status is 'done'.",
-    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        title = info.get("title")
+        duration = info.get("duration")
+        subtitles = info.get("subtitles", {}) or info.get("automatic_captions", {})
+
+        if language not in subtitles:
+            return {"title": title, "url": url, "segments": [], "error": f"No subtitles for language: {language}"}
+
+        sub_url = None
+        for fmt in subtitles[language]:
+            if fmt.get("ext") == "json3":
+                sub_url = fmt["url"]
+                break
+        if not sub_url:
+            sub_url = subtitles[language][0]["url"]
+
+        try:
+            with urllib.request.urlopen(sub_url) as resp:
+                raw = resp.read().decode("utf-8")
+        except Exception as e:
+            return {"title": title, "url": url, "segments": [], "error": str(e)}
+
+        segments = []
+        try:
+            data = json.loads(raw)
+            for event in data.get("events", []):
+                segs = event.get("segs")
+                if not segs:
+                    continue
+                text = "".join(s.get("utf8", "") for s in segs).strip()
+                if not text or text == "\n":
+                    continue
+                start_ms = event.get("tStartMs", 0)
+                minutes = start_ms // 60000
+                seconds = (start_ms % 60000) // 1000
+                segments.append({"timestamp": f"~{minutes}:{seconds:02d}", "start_ms": start_ms, "text": text})
+                if len(segments) >= max_segments:
+                    break
+        except Exception:
+            segments = [{"timestamp": "N/A", "text": raw[:2000]}]
+
+        return {
+            "title": title,
+            "url": url,
+            "duration_seconds": duration,
+            "language": language,
+            "segments": segments,
+            "segment_count": len(segments),
+        }
 
 
 @mcp.tool()
@@ -333,11 +411,8 @@ def score_relevance(
     source_title: str = "",
 ) -> dict:
     """
-    Compute a rubric relevance score (0–100) for a piece of content
-    against a source's monitoring context. Combines keyword signal
-    weight with context specificity. Used as the pass/fail gate before
-    a digest item is included. Per project spec: top-N items selected
-    when too many qualify; threshold can loosen slightly on low-news days.
+    Compute a rubric relevance score (0–100) for content against a monitoring context.
+    Top-N items selected when too many qualify; threshold loosens on low-news days.
     """
     score = 0
     rationale = []
@@ -345,9 +420,7 @@ def score_relevance(
     kw_score = min(len(keyword_matches) * 10, 40)
     score += kw_score
     if keyword_matches:
-        rationale.append(
-            f"Keyword matches ({', '.join(keyword_matches[:5])}): +{kw_score}"
-        )
+        rationale.append(f"Keyword matches ({', '.join(keyword_matches[:5])}): +{kw_score}")
 
     context_words = set(monitoring_context.lower().split())
     text_words = set(text.lower().split())
@@ -355,9 +428,7 @@ def score_relevance(
     context_score = min(int((len(overlap) / max(len(context_words), 1)) * 40), 40)
     score += context_score
     if overlap:
-        rationale.append(
-            f"Context overlap ({len(overlap)} shared terms): +{context_score}"
-        )
+        rationale.append(f"Context overlap ({len(overlap)} shared terms): +{context_score}")
 
     length_score = min(len(text.split()) // 50, 20)
     score += length_score
@@ -375,10 +446,7 @@ def score_relevance(
         "rationale": rationale,
         "monitoring_context": monitoring_context,
         "recommendation": "include_in_digest" if passes else "exclude",
-        "note": (
-            "Consider lowering threshold to 35 on low-news days per project spec."
-            if not passes else ""
-        ),
+        "note": "Consider lowering threshold to 35 on low-news days per project spec." if not passes else "",
     }
 
 
@@ -396,40 +464,25 @@ def format_digest_item(
 ) -> dict:
     """
     Format a single digest item into the standard Slack-ready structure.
-    Applies project digest format rules: 5–10 bullets, timestamps for
-    audio/video, source attribution, and a 'why it's relevant' line
-    referencing the monitoring context and rubric score.
+    5–10 bullets, timestamps for audio/video, source attribution per project spec.
     """
     if len(bullets) > 10:
         bullets = bullets[:10]
 
-    duration_str = ""
-    if duration_seconds:
-        mins = duration_seconds // 60
-        duration_str = f"{mins} min"
-
+    duration_str = f"{duration_seconds // 60} min" if duration_seconds else ""
     source_label = {
-        "video": "Video",
-        "podcast": "Podcast",
-        "article": "Article",
-        "newsletter": "Newsletter",
-        "rss": "Article",
+        "video": "Video", "podcast": "Podcast", "article": "Article",
+        "newsletter": "Newsletter", "rss": "Article",
     }.get(source_type.lower(), source_type.capitalize())
 
     meta = f"[{uploader} · {source_label}" + (f" · {duration_str}" if duration_str else "") + "]"
     if upload_date and len(upload_date) == 8:
-        formatted_date = f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:]}"
-        meta += f" · {formatted_date}"
+        meta += f" · {upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:]}"
 
     bullet_lines = "\n".join(f"- {b}" for b in bullets)
-
     slack_block = (
-        f"*{title}*\n"
-        f"{meta}\n"
-        f"_{monitoring_context}_\n\n"
-        f"{bullet_lines}\n\n"
-        f"🔗 {source_url}\n"
-        f"📊 Relevance score: {relevance_score}/100"
+        f"*{title}*\n{meta}\n_{monitoring_context}_\n\n"
+        f"{bullet_lines}\n\n🔗 {source_url}\n📊 Relevance score: {relevance_score}/100"
     )
 
     return {
@@ -454,14 +507,10 @@ def build_digest(
     max_items: int = 10,
 ) -> dict:
     """
-    Assemble a full daily digest from a list of scored and formatted items.
-    Sorts by relevance score (top-N selection per project spec), applies
-    the item cap, and renders the complete Slack message ready to post
-    to the engineering channel at 6:00 AM.
+    Assemble a full daily digest from scored and formatted items.
+    Sorts by relevance score, caps at max_items, renders Slack message.
     """
-    sorted_items = sorted(
-        items, key=lambda x: x.get("relevance_score", 0), reverse=True
-    )[:max_items]
+    sorted_items = sorted(items, key=lambda x: x.get("relevance_score", 0), reverse=True)[:max_items]
 
     if not sorted_items:
         return {
@@ -477,15 +526,9 @@ def build_digest(
         f"Your daily AI news digest for the Candidly engineering team.\n"
         f"{'─' * 40}"
     )
-
-    body_parts = [item.get("slack_formatted_block", "") for item in sorted_items]
-    footer = (
-        f"{'─' * 40}\n"
-        f"📋 Full source list & attribution log in Notion.\n"
-        f"💬 Feedback? DM this bot directly."
-    )
-
-    full_message = f"{header}\n\n" + "\n\n---\n\n".join(body_parts) + f"\n\n{footer}"
+    body = "\n\n---\n\n".join(i.get("slack_formatted_block", "") for i in sorted_items)
+    footer = f"{'─' * 40}\n📋 Full source list & attribution log in Notion.\n💬 Feedback? DM this bot directly."
+    full_message = f"{header}\n\n{body}\n\n{footer}"
 
     return {
         "issue_number": issue_number,
@@ -499,16 +542,10 @@ def build_digest(
 
 
 @mcp.tool()
-def check_duplicate(
-    item_url: str,
-    item_title: str,
-    post_log: list[dict],
-) -> dict:
+def check_duplicate(item_url: str, item_title: str, post_log: list[dict]) -> dict:
     """
-    Check whether a digest item has already been posted, using the
-    in-memory post log. In production this queries the AWS Post Log
-    table. Prevents duplicate items across daily digest issues per
-    project spec deduplication requirement.
+    Check whether a digest item has already been posted using the post log.
+    Prevents duplicate items across daily digest issues per project spec.
     """
     for entry in post_log:
         if entry.get("url") == item_url or entry.get("title") == item_title:
@@ -519,12 +556,7 @@ def check_duplicate(
                 "previously_posted_date": entry.get("publish_date"),
                 "recommendation": "exclude",
             }
-    return {
-        "is_duplicate": False,
-        "recommendation": "include",
-        "url": item_url,
-        "title": item_title,
-    }
+    return {"is_duplicate": False, "recommendation": "include", "url": item_url, "title": item_title}
 
 
 if __name__ == "__main__":
