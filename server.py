@@ -989,5 +989,149 @@ def normalize_youtube_url(url: str) -> dict:
     }
 
 
+@mcp.tool()
+def get_transcript_text(url: str, language: str = "en") -> dict:
+    """
+    Get the full transcript text for any video or audio URL in a single call.
+    No video is ever downloaded to disk.
+
+    Strategy by source type:
+    - YouTube / any source with native captions: fetches the caption file directly
+      (no download, just an HTTP request for the subtitle URL).
+    - Dailymotion, Vimeo, and other sources without captions: streams audio via
+      ffmpeg directly to S3, starts an AWS Transcribe job, and polls until done
+      (may take 2-5 minutes for longer videos).
+
+    Returns: transcript_text, title, uploader, duration_seconds, source, language.
+    """
+    import json
+    import time
+
+    # --- Step 1: Try native captions first (fast, zero download) ---
+    language_code_map = {
+        "en": "en-US", "fr": "fr-FR", "de": "de-DE", "es": "es-ES",
+        "it": "it-IT", "pt": "pt-BR", "nl": "nl-NL", "ja": "ja-JP",
+        "ko": "ko-KR", "zh": "zh-CN",
+    }
+
+    ydl_opts = make_ydl_opts(
+        writesubtitles=True,
+        writeautomaticsub=True,
+        subtitleslangs=[language],
+        skip_download=True,
+    )
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+
+    title = info.get("title")
+    uploader = info.get("uploader")
+    duration = info.get("duration")
+    upload_date = info.get("upload_date")
+
+    subtitles = info.get("subtitles", {}) or info.get("automatic_captions", {})
+    caption_url = None
+    caption_ext = None
+    if language in subtitles:
+        for fmt in subtitles[language]:
+            if fmt.get("ext") in ("json3", "vtt", "srv3"):
+                caption_url = fmt.get("url")
+                caption_ext = fmt.get("ext")
+                break
+
+    if caption_url:
+        try:
+            with urllib.request.urlopen(caption_url, timeout=30) as resp:
+                raw = resp.read().decode("utf-8")
+
+            # Parse json3 (YouTube's native format) into plain text
+            if caption_ext == "json3":
+                try:
+                    data = json.loads(raw)
+                    parts = []
+                    for event in data.get("events", []):
+                        segs = event.get("segs")
+                        if not segs:
+                            continue
+                        text = "".join(s.get("utf8", "") for s in segs).strip()
+                        if text and text != "\n":
+                            parts.append(text)
+                    transcript_text = " ".join(parts)
+                except Exception:
+                    transcript_text = raw[:8000]
+            else:
+                # VTT / SRV3: strip tags and timing lines
+                import re as _re
+                lines = []
+                for line in raw.splitlines():
+                    line = line.strip()
+                    if not line or "-->" in line or line.isdigit():
+                        continue
+                    line = _re.sub(r"<[^>]+>", "", line)
+                    if line:
+                        lines.append(line)
+                transcript_text = " ".join(lines)
+
+            return {
+                "title": title,
+                "uploader": uploader,
+                "duration_seconds": duration,
+                "upload_date": upload_date,
+                "url": url,
+                "language": language,
+                "transcript_text": transcript_text,
+                "transcript_source": "native_captions",
+                "char_count": len(transcript_text),
+            }
+        except Exception as exc:
+            pass  # caption fetch failed — fall through to audio transcription
+
+    # --- Step 2: No captions — stream audio to S3 and transcribe ---
+    language_code = language_code_map.get(language, f"{language}-{language.upper()}")
+    job = start_podcast_transcription(url, language_code=language_code)
+
+    if job.get("error"):
+        return {
+            "title": title, "uploader": uploader, "url": url,
+            "transcript_text": None,
+            "error": job["error"],
+            "transcript_source": "failed",
+        }
+
+    job_name = job.get("job_name")
+
+    # Poll until complete (max ~8 minutes, suitable for videos up to ~60 min)
+    for _ in range(48):
+        time.sleep(10)
+        result = get_transcription_result(job_name)
+        status = result.get("status")
+        if status == "COMPLETED":
+            return {
+                "title": title,
+                "uploader": uploader,
+                "duration_seconds": duration,
+                "upload_date": upload_date,
+                "url": url,
+                "language": language,
+                "transcript_text": result.get("transcript"),
+                "transcript_source": "aws_transcribe",
+                "char_count": len(result.get("transcript") or ""),
+            }
+        if status == "FAILED":
+            return {
+                "title": title, "uploader": uploader, "url": url,
+                "transcript_text": None,
+                "error": result.get("error", "AWS Transcribe job failed"),
+                "transcript_source": "failed",
+            }
+
+    return {
+        "title": title, "uploader": uploader, "url": url,
+        "transcript_text": None,
+        "transcript_source": "timeout",
+        "job_name": job_name,
+        "next_step": f"Job is still running. Call get_transcription_result('{job_name}') to check.",
+    }
+
+
 if __name__ == "__main__":
     mcp.run()
