@@ -103,7 +103,48 @@ def make_ydl_opts(*, require_ffmpeg: bool = False, **options) -> dict:
         opts.setdefault("cookiefile", cookies_file)
     # Bypass age gates without requiring login when no cookies are provided.
     opts.setdefault("age_limit", 99)
+    # Use the iOS player client for YouTube by default. The iOS API endpoint does
+    # not enforce the bot-check that the web client triggers on headless servers,
+    # and it still returns auto-generated captions in the info dict.
+    opts.setdefault("extractor_args", {"youtube": {"player_client": ["ios", "web"]}})
     return opts
+
+
+_BOT_CHECK_HINTS = (
+    "sign in to confirm",
+    "confirm you're not a bot",
+    "bot",
+    "login required",
+    "authentication",
+    "members only",
+    "private",
+    "age-restricted",
+    "confirm your age",
+)
+
+
+def _is_auth_error(msg: str) -> bool:
+    return any(h in msg.lower() for h in _BOT_CHECK_HINTS)
+
+
+def _extract_info_with_fallback(url: str, ydl_opts: dict) -> dict:
+    """
+    Try extract_info with the given opts; if YouTube bot-check fires, retry
+    with the TV-embedded client which bypasses the check without cookies.
+    """
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            return ydl.extract_info(url, download=False)
+    except yt_dlp.utils.ExtractorError as exc:
+        if not _is_auth_error(str(exc)):
+            raise
+        # Bot check hit — retry with tv_embedded which has no bot verification
+        fallback_opts = {
+            **ydl_opts,
+            "extractor_args": {"youtube": {"player_client": ["tv_embedded", "ios"]}},
+        }
+        with yt_dlp.YoutubeDL(fallback_opts) as ydl:
+            return ydl.extract_info(url, download=False)
 
 
 # ─────────────────────────────────────────────
@@ -1028,26 +1069,24 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
         skip_download=True,
     )
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+        info = _extract_info_with_fallback(url, ydl_opts)
     except yt_dlp.utils.ExtractorError as exc:
         msg = str(exc)
-        _auth_hints = ("sign in", "login", "authentication", "members only",
-                       "private", "age-restricted", "confirm your age")
-        if any(h in msg.lower() for h in _auth_hints):
+        if _is_auth_error(msg):
             return {
                 "url": url,
                 "transcript_text": None,
                 "transcript_source": "failed",
                 "error": (
-                    "This video requires authentication. "
-                    "Set the YTDLP_COOKIES_FILE environment variable to the path of a "
-                    "Netscape-format cookies.txt exported from a logged-in browser "
-                    "(use the 'Get cookies.txt LOCALLY' Chrome extension). "
+                    "This video requires authentication even after trying alternative "
+                    "player clients (ios, tv_embedded). Set the YTDLP_COOKIES_FILE "
+                    "environment variable to a Netscape-format cookies.txt exported "
+                    "from a browser logged into YouTube. "
                     f"Raw error: {msg[:300]}"
                 ),
-                "hint": "Export cookies from Chrome/Firefox while logged into YouTube, "
-                        "save as cookies.txt, and set YTDLP_COOKIES_FILE=/path/to/cookies.txt",
+                "hint": "Export cookies: install 'Get cookies.txt LOCALLY' in Chrome, "
+                        "log into YouTube, click the extension → Export, save as cookies.txt, "
+                        "then set YTDLP_COOKIES_FILE=/path/to/cookies.txt on the server.",
             }
         return {
             "url": url,
