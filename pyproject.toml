@@ -50,6 +50,7 @@ dependencies = [
     "langchain-mcp-adapters>=0.1",
     "langgraph>=0.2",
     "boto3>=1.26",
+    "curl-cffi>=0.10,<0.16 ; implementation_name == 'cpython'",
 ]
 
 [project.optional-dependencies]
