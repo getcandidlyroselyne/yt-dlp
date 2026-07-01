@@ -345,17 +345,41 @@ def _fetch_youtube_transcript(video_id: str, language: str) -> tuple[str | None,
                            error describes why it failed (or None on success).
     """
     # ------------------------------------------------------------------
-    # Step 1: yt-dlp iOS client → timedtext URL → direct HTTP fetch
-    # This bypasses the bot-check entirely: process=False skips the video
-    # format check that raises ExtractorError on cloud IPs.
+    # Build a cookie-authenticated session used for ALL HTTP fetches below.
+    # YouTube's timedtext CDN and the youtube-transcript-api both need the
+    # same session cookies to accept requests from datacenter IPs.
     # ------------------------------------------------------------------
+    import http.cookiejar as _cookiejar
+    import requests as _requests
+
+    _session = _requests.Session()
+    _session.headers.update({"User-Agent": "Mozilla/5.0"})
+    cookies_file = os.environ.get("YTDLP_COOKIES_FILE")
+    if cookies_file and Path(cookies_file).is_file():
+        _jar = _cookiejar.MozillaCookieJar(cookies_file)
+        try:
+            _jar.load(ignore_discard=True, ignore_expires=True)
+            _session.cookies = _jar  # type: ignore[assignment]
+        except Exception:
+            pass
+    _proxy = (
+        os.environ.get("YTDLP_PROXY")
+        or os.environ.get("HTTPS_PROXY")
+        or os.environ.get("https_proxy")
+    )
+    if _proxy:
+        _session.proxies.update({"http": _proxy, "https": _proxy})
+
+    # ------------------------------------------------------------------
+    # Step 1: yt-dlp iOS client → timedtext URL → authenticated HTTP fetch
+    # process=False skips process_video_result (which errors on missing
+    # video formats) so we only extract caption metadata, not streams.
+    # The timedtext CDN requires the same YouTube session cookies on AWS IPs.
+    # ------------------------------------------------------------------
+    fetch_errors: list[str] = []
     try:
         ydl_opts = make_ydl_opts(
-            # iOS client provides subtitle URLs without needing PO tokens or bot-check bypass.
-            # process=False is set on the extract_info call so we never reach
-            # process_video_result which errors on missing video formats.
             extractor_args={"youtube": {"player_client": ["ios"]}},
-            # Suppress the PO-token warning — we only need subtitles, not streams.
             no_warnings=True,
         )
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -367,8 +391,14 @@ def _fetch_youtube_transcript(video_id: str, language: str) -> tuple[str | None,
 
         auto_caps: dict = info.get("automatic_captions", {})
         manual_subs: dict = info.get("subtitles", {})
+        cookies_loaded = cookies_file and Path(cookies_file).is_file()
+        print(
+            f"[yt-dlp timedtext] video={video_id} lang={language} "
+            f"auto_langs={len(auto_caps)} manual_langs={len(manual_subs)} "
+            f"cookies={'yes' if cookies_loaded else 'no'} proxy={'yes' if _proxy else 'no'}",
+            flush=True,
+        )
 
-        # Prefer manual subtitles, then auto-generated; match language code
         def _find_entries(caps_dict: dict) -> list[dict]:
             for code in [language, f"{language}-orig", language.split("-")[0]]:
                 if code in caps_dict:
@@ -377,10 +407,8 @@ def _fetch_youtube_transcript(video_id: str, language: str) -> tuple[str | None,
 
         entries = _find_entries(manual_subs) or _find_entries(auto_caps)
         if not entries:
-            # Any auto-generated language — last resort
             entries = next(iter(auto_caps.values()), [])
 
-        # Prefer json3 (easiest to parse), then srv1/srv2/vtt
         pref = {"json3": 0, "srv3": 1, "srv2": 2, "srv1": 3, "vtt": 4}
         entries_sorted = sorted(entries, key=lambda e: pref.get(e.get("ext", ""), 99))
 
@@ -389,12 +417,9 @@ def _fetch_youtube_transcript(video_id: str, language: str) -> tuple[str | None,
             if not sub_url:
                 continue
             try:
-                req = urllib.request.Request(
-                    sub_url,
-                    headers={"User-Agent": "Mozilla/5.0"},
-                )
-                with urllib.request.urlopen(req, timeout=15) as resp:
-                    raw = resp.read()
+                resp = _session.get(sub_url, timeout=15)
+                resp.raise_for_status()
+                raw = resp.content
 
                 ext = entry.get("ext", "")
                 if ext == "json3":
@@ -418,12 +443,15 @@ def _fetch_youtube_transcript(video_id: str, language: str) -> tuple[str | None,
 
                 if text:
                     return text, None
-            except Exception:
+                fetch_errors.append(f"{ext}: empty content")
+            except Exception as fetch_exc:
+                fetch_errors.append(f"{entry.get('ext','?')}: {type(fetch_exc).__name__}({fetch_exc})")
                 continue
     except Exception as ytdlp_exc:
-        ytdlp_error = f"yt-dlp: {type(ytdlp_exc).__name__}: {ytdlp_exc}"
+        ytdlp_error = f"yt-dlp extract_info: {type(ytdlp_exc).__name__}: {ytdlp_exc}"
     else:
-        ytdlp_error = "yt-dlp: no usable subtitle entries found"
+        errs = "; ".join(fetch_errors) if fetch_errors else "no subtitle entries returned"
+        ytdlp_error = f"yt-dlp timedtext fetch failed: {errs}"
 
     # ------------------------------------------------------------------
     # Step 2: Invidious public API fallback
@@ -433,7 +461,7 @@ def _fetch_youtube_transcript(video_id: str, language: str) -> tuple[str | None,
         return text, None
 
     # ------------------------------------------------------------------
-    # Step 3: youtube-transcript-api with cookie session
+    # Step 3: youtube-transcript-api reusing the same cookie session
     # ------------------------------------------------------------------
     try:
         from youtube_transcript_api import (
@@ -447,28 +475,8 @@ def _fetch_youtube_transcript(video_id: str, language: str) -> tuple[str | None,
     except ImportError:
         return None, f"{ytdlp_error}; Invidious: {inv_error}; youtube-transcript-api not installed"
 
-    import http.cookiejar as _cookiejar
-    import requests as _requests
-
-    session = _requests.Session()
-    cookies_file = os.environ.get("YTDLP_COOKIES_FILE")
-    if cookies_file and Path(cookies_file).is_file():
-        jar = _cookiejar.MozillaCookieJar(cookies_file)
-        try:
-            jar.load(ignore_discard=True, ignore_expires=True)
-            session.cookies = jar  # type: ignore[assignment]
-        except Exception:
-            pass
-    proxy = (
-        os.environ.get("YTDLP_PROXY")
-        or os.environ.get("HTTPS_PROXY")
-        or os.environ.get("https_proxy")
-    )
-    if proxy:
-        session.proxies.update({"http": proxy, "https": proxy})
-
     try:
-        api = YouTubeTranscriptApi(http_client=session)
+        api = YouTubeTranscriptApi(http_client=_session)
         for langs in ([language], None):
             try:
                 fetch_kwargs: dict = {"languages": langs} if langs else {}
