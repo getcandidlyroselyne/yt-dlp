@@ -5,6 +5,8 @@ import platform
 import re
 import shutil
 import stat
+import subprocess
+import sys
 import tarfile
 import tempfile
 import urllib.request
@@ -12,6 +14,16 @@ from pathlib import Path
 
 from fastmcp import FastMCP
 import yt_dlp
+
+# curl-cffi is required for Dailymotion (and other sites) that need browser impersonation.
+# Install it automatically if missing so the server works regardless of which Python runs it.
+try:
+    import curl_cffi  # noqa: F401
+except ImportError:
+    subprocess.check_call(
+        [sys.executable, "-m", "pip", "install", "--quiet", "curl-cffi>=0.10,<0.16"],
+        stdout=subprocess.DEVNULL,
+    )
 
 import s3_utils
 
