@@ -877,35 +877,24 @@ def start_podcast_transcription(url: str, language_code: str = "en-US") -> dict:
     if not stream_url:
         return {"error": "Could not resolve a direct audio stream URL", "url": url, "step": "select_format"}
 
-    # HLS/DASH streams (m3u8, mpd) can't be downloaded with a plain HTTP fetch —
-    # they're manifests, not audio files. Use yt-dlp + ffmpeg to remux them into
-    # a proper mp4 that AWS Transcribe can accept.
-    is_hls = audio_ext in ("m3u8", "mpd") or "m3u8" in stream_url or ".m3u8" in stream_url
+    import threading
 
     bucket = s3_utils.bucket_name()
     job_suffix = str(uuid.uuid4())[:8]
     safe_title = s3_utils._safe_key(info.get("title") or "podcast")
 
+    # Always normalise through ffmpeg when available:
+    # - HLS/DASH streams (m3u8) cannot be fetched with plain HTTP at all.
+    # - Direct audio files may have non-standard sample rates that cause
+    #   AWS Transcribe's "Invalid sample rate" error.
+    # ffmpeg's -i accepts any URL (m3u8, direct mp3/m4a, http redirect), so
+    # we use the same pipeline for everything and guarantee a clean 16 kHz
+    # mono MP3 that Transcribe always accepts.
+    ffmpeg_loc = _resolve_ffmpeg_location()
+    ffmpeg_bin = os.path.join(ffmpeg_loc, "ffmpeg") if ffmpeg_loc else shutil.which("ffmpeg")
+
     try:
-        if is_hls:
-            # Step 2a: HLS — pipe ffmpeg stdout directly to S3, zero disk writes.
-            # Writing HLS to a temp file fails in disk-constrained environments;
-            # MP3 is a streamable format so ffmpeg can write to pipe:1 without seeking.
-            import threading
-
-            ffmpeg_loc = _resolve_ffmpeg_location()
-            ffmpeg_bin = (
-                os.path.join(ffmpeg_loc, "ffmpeg") if ffmpeg_loc
-                else shutil.which("ffmpeg")
-            )
-            if not ffmpeg_bin:
-                return {
-                    "error": "ffmpeg is required to process HLS streams but was not found",
-                    "url": url,
-                    "step": "hls_ffmpeg_check",
-                    "hint": "Install ffmpeg or set FFMPEG_LOCATION env var.",
-                }
-
+        if ffmpeg_bin:
             audio_ext = "mp3"
             audio_s3_key = f"podcast-audio/{safe_title}-{job_suffix}.{audio_ext}"
             s3_client = boto3.client("s3", region_name=region)
@@ -913,18 +902,17 @@ def start_podcast_transcription(url: str, language_code: str = "en-US") -> dict:
             cmd = [
                 ffmpeg_bin, "-y",
                 "-i", stream_url,
-                "-vn",                    # strip video track
-                "-acodec", "libmp3lame",  # encode to MP3
-                "-ar", "16000",           # normalize to 16 kHz — standard for speech ASR
-                "-ac", "1",              # mono — halves file size, fine for speech
-                "-q:a", "4",              # VBR ~165 kbps
-                "-f", "mp3",              # MP3 is fully streamable (no seek)
+                "-vn",                   # strip video
+                "-acodec", "libmp3lame",
+                "-ar", "16000",          # 16 kHz — standard for speech ASR
+                "-ac", "1",              # mono — halves size, fine for speech
+                "-q:a", "4",             # VBR ~165 kbps
+                "-f", "mp3",             # MP3 is fully streamable (no seeking needed)
                 "pipe:1",
             ]
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-            # Drain stderr on a background thread to prevent deadlock if the
-            # 64 KB pipe buffer fills before stdout (the audio stream) is fully read.
+            # Drain stderr on a background thread to prevent pipe deadlock.
             stderr_chunks: list[bytes] = []
             def _drain_stderr() -> None:
                 stderr_chunks.append(proc.stderr.read())
@@ -941,12 +929,21 @@ def start_podcast_transcription(url: str, language_code: str = "en-US") -> dict:
             if proc.returncode != 0:
                 stderr_text = b"".join(stderr_chunks).decode(errors="replace")[-400:]
                 return {
-                    "error": f"ffmpeg HLS remux failed (exit {proc.returncode}): {stderr_text}",
+                    "error": f"ffmpeg encode failed (exit {proc.returncode}): {stderr_text}",
                     "url": url,
-                    "step": "hls_remux",
+                    "step": "ffmpeg_encode",
                 }
         else:
-            # Step 2b: Direct audio file — download into memory, no disk writes
+            # ffmpeg not available — fall back to raw download for direct audio URLs only.
+            # HLS streams will not work via this path.
+            is_hls = audio_ext in ("m3u8", "mpd") or "m3u8" in stream_url
+            if is_hls:
+                return {
+                    "error": "ffmpeg is required to process HLS streams but was not found",
+                    "url": url,
+                    "step": "ffmpeg_missing",
+                    "hint": "Install ffmpeg or set FFMPEG_LOCATION env var.",
+                }
             req = urllib.request.Request(stream_url, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=300) as resp:
                 audio_bytes = io.BytesIO(resp.read())
@@ -981,9 +978,10 @@ def start_podcast_transcription(url: str, language_code: str = "en-US") -> dict:
             "OutputBucketName": bucket,
             "OutputKey": transcript_s3_key,
         }
-        # For HLS-sourced MP3 we know the exact sample rate; passing it explicitly
-        # avoids the "Invalid sample rate" error when Transcribe auto-detection fails.
-        if is_hls:
+        # When ffmpeg normalised the audio we know the exact output sample rate,
+        # so we pass it explicitly — this prevents Transcribe's auto-detection
+        # from failing on unusual source rates.
+        if ffmpeg_bin and audio_ext == "mp3":
             transcribe_kwargs["MediaSampleRateHertz"] = 16000
         transcribe.start_transcription_job(**transcribe_kwargs)
     except Exception as exc:
