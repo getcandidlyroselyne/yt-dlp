@@ -95,7 +95,7 @@ def _resolve_ffmpeg_location() -> str | None:
 
 
 def make_ydl_opts(*, require_ffmpeg: bool = False, **options) -> dict:
-    opts = {"quiet": True, "cachedir": False, **options}
+    opts = {"quiet": True, "no_warnings": True, "cachedir": False, "logger": _SilentLogger(), **options}
     if require_ffmpeg:
         ffmpeg_location = _resolve_ffmpeg_location()
         if ffmpeg_location:
@@ -129,6 +129,37 @@ _BOT_CHECK_HINTS = (
 
 def _is_auth_error(msg: str) -> bool:
     return any(h in msg.lower() for h in _BOT_CHECK_HINTS)
+
+
+class _SilentLogger:
+    """Suppress all yt-dlp console output — errors are handled via exceptions."""
+    def debug(self, msg: str) -> None: pass
+    def info(self, msg: str) -> None: pass
+    def warning(self, msg: str) -> None: pass
+    def error(self, msg: str) -> None: pass
+
+
+def _youtube_oembed_meta(video_id: str) -> dict:
+    """
+    Fetch lightweight YouTube metadata via the oEmbed endpoint.
+    Requires no authentication and is never bot-checked.
+    """
+    import json as _json
+    oembed_url = (
+        f"https://www.youtube.com/oembed"
+        f"?url=https://www.youtube.com/watch?v={video_id}&format=json"
+    )
+    try:
+        with urllib.request.urlopen(oembed_url, timeout=10) as resp:
+            data = _json.loads(resp.read())
+        return {
+            "title": data.get("title"),
+            "uploader": data.get("author_name"),
+            "duration_seconds": None,
+            "upload_date": None,
+        }
+    except Exception:
+        return {}
 
 
 def _youtube_video_id(url: str) -> str | None:
@@ -1117,17 +1148,11 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
     if yt_id:
         text = _fetch_youtube_transcript(yt_id, language)
         if text:
-            # Get lightweight metadata via yt-dlp (rarely bot-checked for flat extract)
-            meta: dict = {}
-            try:
-                with yt_dlp.YoutubeDL(make_ydl_opts(skip_download=True, extract_flat=True)) as ydl:
-                    meta = ydl.extract_info(url, download=False) or {}
-            except Exception:
-                pass
+            meta = _youtube_oembed_meta(yt_id)
             return {
                 "title": meta.get("title"),
-                "uploader": meta.get("uploader") or meta.get("channel"),
-                "duration_seconds": meta.get("duration"),
+                "uploader": meta.get("uploader"),
+                "duration_seconds": meta.get("duration_seconds"),
                 "upload_date": meta.get("upload_date"),
                 "url": url,
                 "language": language,
@@ -1135,6 +1160,43 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
                 "transcript_source": "youtube_transcript_api",
                 "char_count": len(text),
             }
+        # No captions on this YouTube video — go straight to audio transcription.
+        # Do NOT call yt-dlp for metadata here; that triggers the bot check.
+        language_code = language_code_map.get(language, f"{language}-{language.upper()}")
+        job = start_podcast_transcription(url, language_code=language_code)
+        meta = _youtube_oembed_meta(yt_id)
+        if job.get("error"):
+            return {
+                **meta,
+                "url": url,
+                "transcript_text": None,
+                "error": job["error"],
+                "transcript_source": "failed",
+            }
+        job_name = job.get("job_name")
+        for _ in range(48):
+            time.sleep(10)
+            result = get_transcription_result(job_name)
+            if result.get("status") == "COMPLETED":
+                return {
+                    **meta,
+                    "url": url,
+                    "language": language,
+                    "transcript_text": result.get("transcript"),
+                    "transcript_source": "aws_transcribe",
+                    "char_count": len(result.get("transcript") or ""),
+                }
+            if result.get("status") == "FAILED":
+                return {
+                    **meta, "url": url, "transcript_text": None,
+                    "error": result.get("error", "AWS Transcribe job failed"),
+                    "transcript_source": "failed",
+                }
+        return {
+            **meta, "url": url, "transcript_text": None,
+            "transcript_source": "timeout", "job_name": job_name,
+            "next_step": f"Call get_transcription_result('{job_name}') to check.",
+        }
 
     ydl_opts = make_ydl_opts(
         writesubtitles=True,
