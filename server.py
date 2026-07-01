@@ -170,15 +170,20 @@ def make_ydl_opts(*, require_ffmpeg: bool = False, **options) -> dict:
         if ffmpeg_location:
             opts.setdefault("ffmpeg_location", ffmpeg_location)
     # Support a Netscape-format cookies file for age-restricted / auth-gated videos.
-    # Set YTDLP_COOKIES_FILE=/path/to/cookies.txt in the environment to enable.
     cookies_file = os.environ.get("YTDLP_COOKIES_FILE")
     if cookies_file and Path(cookies_file).is_file():
         opts.setdefault("cookiefile", cookies_file)
-    # Bypass age gates without requiring login when no cookies are provided.
+    # Route ALL yt-dlp network calls through the proxy when set.
+    # Without this, the iOS player API call goes through the bare AWS IP and
+    # gets bot-checked even when the user has configured YTDLP_PROXY.
+    proxy = (
+        os.environ.get("YTDLP_PROXY")
+        or os.environ.get("HTTPS_PROXY")
+        or os.environ.get("https_proxy")
+    )
+    if proxy:
+        opts.setdefault("proxy", proxy)
     opts.setdefault("age_limit", 99)
-    # Use the iOS player client for YouTube by default. The iOS API endpoint does
-    # not enforce the bot-check that the web client triggers on headless servers,
-    # and it still returns auto-generated captions in the info dict.
     opts.setdefault("extractor_args", {"youtube": {"player_client": ["ios", "web"]}})
     return opts
 
@@ -256,34 +261,36 @@ _INVIDIOUS_INSTANCES = [
 ]
 
 
-def _fetch_transcript_via_invidious(video_id: str, language: str) -> tuple[str | None, str | None]:
+def _fetch_transcript_via_invidious(
+    video_id: str, language: str, session=None
+) -> tuple[str | None, str | None]:
     """
     Fetch YouTube captions via public Invidious instances.
-    Invidious proxies caption requests through their own servers, bypassing
-    YouTube's datacenter IP blocks entirely — no cookies or proxy needed.
-    Tries multiple instances in order, returning the first successful result.
+    Accepts an optional requests.Session so proxy/cookie settings are honoured.
     """
     import json as _json
     import re as _re
 
+    if session is None:
+        import requests as _req
+        session = _req.Session()
+        session.headers.update({"User-Agent": "Mozilla/5.0"})
+
     last_error: str = "no instances tried"
     for instance in _INVIDIOUS_INSTANCES:
         try:
-            req = urllib.request.Request(
-                f"{instance}/api/v1/captions/{video_id}",
-                headers={"User-Agent": "Mozilla/5.0"},
-            )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = _json.loads(resp.read())
+            resp = session.get(f"{instance}/api/v1/captions/{video_id}", timeout=10)
+            resp.raise_for_status()
+            data = _json.loads(resp.content)
 
             captions = data.get("captions", [])
             if not captions:
                 last_error = f"{instance}: no captions returned"
                 continue
 
-            # Prefer exact language match, then auto-generated, then anything
+            # Invidious returns camelCase 'languageCode'
             def _priority(cap: dict) -> int:
-                code = cap.get("language_code", "").lower()
+                code = cap.get("languageCode", "").lower()
                 label = cap.get("label", "").lower()
                 if code == language or code.startswith(f"{language}-"):
                     return 0 if "auto" not in label else 1
@@ -295,9 +302,9 @@ def _fetch_transcript_via_invidious(video_id: str, language: str) -> tuple[str |
             sep = "&" if "?" in cap_url else "?"
             cap_url += f"{sep}format=vtt"
 
-            req2 = urllib.request.Request(cap_url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req2, timeout=15) as resp2:
-                vtt = resp2.read().decode("utf-8")
+            resp2 = session.get(cap_url, timeout=15)
+            resp2.raise_for_status()
+            vtt = resp2.text
 
             lines = []
             for line in vtt.splitlines():
@@ -315,7 +322,7 @@ def _fetch_transcript_via_invidious(video_id: str, language: str) -> tuple[str |
         except Exception as exc:
             last_error = f"{instance}: {type(exc).__name__}: {exc}"
 
-    return None, f"All Invidious instances failed. Last error: {last_error}"
+    return None, f"All Invidious instances failed. Last: {last_error}"
 
 
 def _parse_json3_transcript(data: dict) -> str:
@@ -454,9 +461,9 @@ def _fetch_youtube_transcript(video_id: str, language: str) -> tuple[str | None,
         ytdlp_error = f"yt-dlp timedtext fetch failed: {errs}"
 
     # ------------------------------------------------------------------
-    # Step 2: Invidious public API fallback
+    # Step 2: Invidious public API fallback (uses same proxy session)
     # ------------------------------------------------------------------
-    text, inv_error = _fetch_transcript_via_invidious(video_id, language)
+    text, inv_error = _fetch_transcript_via_invidious(video_id, language, session=_session)
     if text:
         return text, None
 
