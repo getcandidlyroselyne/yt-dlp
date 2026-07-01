@@ -29,6 +29,47 @@ def _ensure_pkg(import_name: str, pip_spec: str) -> None:
 _ensure_pkg("curl_cffi", "curl-cffi>=0.10,<0.16")
 _ensure_pkg("youtube_transcript_api", "youtube-transcript-api>=0.6")
 
+
+def _resolve_cookies_file() -> None:
+    """
+    If YTDLP_COOKIES_FILE is an https:// or s3:// URL, download it to a
+    local temp file and update the env var to that path.
+    Runs once at startup so every tool picks up the local path transparently.
+    """
+    value = os.environ.get("YTDLP_COOKIES_FILE", "")
+    if not value:
+        return
+    if Path(value).is_file():
+        return  # already a valid local path
+
+    local_path = Path(tempfile.gettempdir()) / "ytdlp_cookies.txt"
+
+    if value.startswith("s3://"):
+        try:
+            import boto3 as _boto3
+            parts = value[5:].split("/", 1)
+            bucket, key = parts[0], parts[1] if len(parts) > 1 else ""
+            region = os.environ.get("AWS_REGION", "us-east-1")
+            _boto3.client("s3", region_name=region).download_file(bucket, key, str(local_path))
+            os.environ["YTDLP_COOKIES_FILE"] = str(local_path)
+        except Exception as exc:
+            print(f"[server] WARNING: could not download cookies from S3 ({value}): {exc}",
+                  flush=True)
+        return
+
+    if value.startswith("https://") or value.startswith("http://"):
+        try:
+            req = urllib.request.Request(value, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                local_path.write_bytes(resp.read())
+            os.environ["YTDLP_COOKIES_FILE"] = str(local_path)
+        except Exception as exc:
+            print(f"[server] WARNING: could not download cookies from URL ({value}): {exc}",
+                  flush=True)
+
+
+_resolve_cookies_file()
+
 import s3_utils
 
 mcp = FastMCP("yt-dlp")
