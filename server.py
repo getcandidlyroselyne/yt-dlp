@@ -96,6 +96,13 @@ def make_ydl_opts(*, require_ffmpeg: bool = False, **options) -> dict:
         ffmpeg_location = _resolve_ffmpeg_location()
         if ffmpeg_location:
             opts.setdefault("ffmpeg_location", ffmpeg_location)
+    # Support a Netscape-format cookies file for age-restricted / auth-gated videos.
+    # Set YTDLP_COOKIES_FILE=/path/to/cookies.txt in the environment to enable.
+    cookies_file = os.environ.get("YTDLP_COOKIES_FILE")
+    if cookies_file and Path(cookies_file).is_file():
+        opts.setdefault("cookiefile", cookies_file)
+    # Bypass age gates without requiring login when no cookies are provided.
+    opts.setdefault("age_limit", 99)
     return opts
 
 
@@ -1020,8 +1027,41 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
         subtitleslangs=[language],
         skip_download=True,
     )
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except yt_dlp.utils.ExtractorError as exc:
+        msg = str(exc)
+        _auth_hints = ("sign in", "login", "authentication", "members only",
+                       "private", "age-restricted", "confirm your age")
+        if any(h in msg.lower() for h in _auth_hints):
+            return {
+                "url": url,
+                "transcript_text": None,
+                "transcript_source": "failed",
+                "error": (
+                    "This video requires authentication. "
+                    "Set the YTDLP_COOKIES_FILE environment variable to the path of a "
+                    "Netscape-format cookies.txt exported from a logged-in browser "
+                    "(use the 'Get cookies.txt LOCALLY' Chrome extension). "
+                    f"Raw error: {msg[:300]}"
+                ),
+                "hint": "Export cookies from Chrome/Firefox while logged into YouTube, "
+                        "save as cookies.txt, and set YTDLP_COOKIES_FILE=/path/to/cookies.txt",
+            }
+        return {
+            "url": url,
+            "transcript_text": None,
+            "transcript_source": "failed",
+            "error": f"Extraction failed: {msg[:400]}",
+        }
+    except Exception as exc:
+        return {
+            "url": url,
+            "transcript_text": None,
+            "transcript_source": "failed",
+            "error": f"Unexpected error during extraction: {str(exc)[:400]}",
+        }
 
     title = info.get("title")
     uploader = info.get("uploader")
