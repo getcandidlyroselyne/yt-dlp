@@ -178,18 +178,22 @@ def _youtube_video_id(url: str) -> str | None:
     return None
 
 
-def _fetch_youtube_transcript(video_id: str, language: str) -> str | None:
+def _fetch_youtube_transcript(video_id: str, language: str) -> tuple[str | None, str | None]:
     """
     Fetch YouTube transcript via youtube-transcript-api.
     Calls YouTube's timedtext endpoint directly — no yt-dlp, no bot check.
-    Returns plain text or None if no transcript is available.
+    Returns (text, error): text is the transcript or None; error describes why it failed.
     """
-    from youtube_transcript_api import (
-        YouTubeTranscriptApi,
-        NoTranscriptFound,
-        TranscriptsDisabled,
-        VideoUnavailable,
-    )
+    try:
+        from youtube_transcript_api import (
+            YouTubeTranscriptApi,
+            NoTranscriptFound,
+            TranscriptsDisabled,
+            VideoUnavailable,
+        )
+    except ImportError:
+        return None, "youtube-transcript-api is not installed"
+
     try:
         api = YouTubeTranscriptApi()
         # Try requested language first, then fall back to any available transcript
@@ -197,15 +201,18 @@ def _fetch_youtube_transcript(video_id: str, language: str) -> str | None:
             try:
                 kwargs = {"languages": langs} if langs else {}
                 transcript = api.fetch(video_id, **kwargs)
-                return " ".join(s.text for s in transcript).strip()
+                text = " ".join(s.text for s in transcript).strip()
+                return text, None
             except NoTranscriptFound:
                 if langs is None:
-                    return None
-        return None
-    except (TranscriptsDisabled, VideoUnavailable):
-        return None
-    except Exception:
-        return None
+                    return None, f"No transcript available for video {video_id} in any language"
+        return None, "No transcript found"
+    except (TranscriptsDisabled,):
+        return None, "Transcripts are disabled for this video"
+    except (VideoUnavailable,):
+        return None, "Video is unavailable"
+    except Exception as exc:
+        return None, f"Transcript fetch error: {type(exc).__name__}: {exc}"
 
 
 def _extract_info_with_fallback(url: str, ydl_opts: dict) -> dict:
@@ -1174,7 +1181,7 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
     # --- Fast path: YouTube-direct transcript (no yt-dlp, no bot check) ---
     yt_id = _youtube_video_id(url)
     if yt_id:
-        text = _fetch_youtube_transcript(yt_id, language)
+        text, transcript_error = _fetch_youtube_transcript(yt_id, language)
         if text:
             meta = _youtube_oembed_meta(yt_id)
             return {
@@ -1188,6 +1195,21 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
                 "transcript_source": "youtube_transcript_api",
                 "char_count": len(text),
             }
+
+        # If youtube-transcript-api isn't installed yet, surface that clearly
+        # rather than falling through to the audio path (which will also fail for YouTube).
+        if transcript_error and "not installed" in transcript_error:
+            return {
+                "url": url,
+                "transcript_text": None,
+                "transcript_source": "failed",
+                "error": (
+                    "youtube-transcript-api is not installed in this environment. "
+                    "The server needs to be restarted or redeployed. "
+                    f"Detail: {transcript_error}"
+                ),
+            }
+
         # No captions on this YouTube video — go straight to audio transcription.
         # Do NOT call yt-dlp for metadata here; that triggers the bot check.
         language_code = language_code_map.get(language, f"{language}-{language.upper()}")
@@ -1200,6 +1222,7 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
                 "transcript_text": None,
                 "error": job["error"],
                 "transcript_source": "failed",
+                "transcript_error": transcript_error,
             }
         job_name = job.get("job_name")
         for _ in range(48):
