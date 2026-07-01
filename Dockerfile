@@ -17,7 +17,7 @@ COPY . /app
 
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
  && . "$HOME/.local/bin/env" \
- && UV_PROJECT_ENVIRONMENT=/usr/local uv sync --frozen --no-dev --inexact
+ && UV_PROJECT_ENVIRONMENT=/usr/local uv sync --frozen --no-dev --inexact --extra curl-cffi
 
 RUN python -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('fastmcp') else 1)"
 RUN python -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('boto3') else 1)"
