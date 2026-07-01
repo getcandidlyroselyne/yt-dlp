@@ -271,25 +271,26 @@ def _fetch_youtube_transcript(video_id: str, language: str) -> tuple[str | None,
     except ImportError:
         return None, "youtube-transcript-api is not installed"
 
-    # Build constructor kwargs from env vars
-    api_kwargs: dict = {}
+    # In youtube-transcript-api v1.x, cookies and proxies are passed to fetch(),
+    # not to the constructor. Build the per-call kwargs here.
+    fetch_extra: dict = {}
     cookies_file = os.environ.get("YTDLP_COOKIES_FILE")
     if cookies_file and Path(cookies_file).is_file():
-        api_kwargs["cookies"] = cookies_file
+        fetch_extra["cookies"] = cookies_file
     proxy = (
         os.environ.get("YTDLP_PROXY")
         or os.environ.get("HTTPS_PROXY")
         or os.environ.get("https_proxy")
     )
     if proxy:
-        api_kwargs["proxies"] = {"http": proxy, "https": proxy}
+        fetch_extra["proxies"] = {"http": proxy, "https": proxy}
 
     try:
-        api = YouTubeTranscriptApi(**api_kwargs)
+        api = YouTubeTranscriptApi()
         # Try requested language first, then fall back to any available transcript
         for langs in ([language], None):
             try:
-                fetch_kwargs = {"languages": langs} if langs else {}
+                fetch_kwargs = {**({"languages": langs} if langs else {}), **fetch_extra}
                 transcript = api.fetch(video_id, **fetch_kwargs)
                 text = " ".join(s.text for s in transcript).strip()
                 return text, None
