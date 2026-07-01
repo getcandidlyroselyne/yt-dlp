@@ -15,15 +15,19 @@ from pathlib import Path
 from fastmcp import FastMCP
 import yt_dlp
 
-# curl-cffi is required for Dailymotion (and other sites) that need browser impersonation.
-# Install it automatically if missing so the server works regardless of which Python runs it.
-try:
-    import curl_cffi  # noqa: F401
-except ImportError:
-    subprocess.check_call(
-        [sys.executable, "-m", "pip", "install", "--quiet", "curl-cffi>=0.10,<0.16"],
-        stdout=subprocess.DEVNULL,
-    )
+# Auto-install optional dependencies that must be present regardless of which
+# Python environment launches the server.
+def _ensure_pkg(import_name: str, pip_spec: str) -> None:
+    try:
+        __import__(import_name)
+    except ImportError:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--quiet", pip_spec],
+            stdout=subprocess.DEVNULL,
+        )
+
+_ensure_pkg("curl_cffi", "curl-cffi>=0.10,<0.16")
+_ensure_pkg("youtube_transcript_api", "youtube-transcript-api>=0.6")
 
 import s3_utils
 
@@ -125,6 +129,52 @@ _BOT_CHECK_HINTS = (
 
 def _is_auth_error(msg: str) -> bool:
     return any(h in msg.lower() for h in _BOT_CHECK_HINTS)
+
+
+def _youtube_video_id(url: str) -> str | None:
+    """Extract the YouTube video ID from any common URL format."""
+    import urllib.parse as _up
+    parsed = _up.urlparse(url.strip())
+    host = parsed.netloc.lower().removeprefix("www.").removeprefix("m.")
+    if host == "youtu.be":
+        return parsed.path.lstrip("/").split("/")[0].split("?")[0] or None
+    if host == "youtube.com":
+        if parsed.path.startswith("/watch"):
+            return _up.parse_qs(parsed.query).get("v", [None])[0]
+        for prefix in ("/shorts/", "/live/", "/embed/", "/v/"):
+            if parsed.path.startswith(prefix):
+                return parsed.path[len(prefix):].split("/")[0].split("?")[0] or None
+    return None
+
+
+def _fetch_youtube_transcript(video_id: str, language: str) -> str | None:
+    """
+    Fetch YouTube transcript via youtube-transcript-api.
+    Calls YouTube's timedtext endpoint directly — no yt-dlp, no bot check.
+    Returns plain text or None if no transcript is available.
+    """
+    from youtube_transcript_api import (
+        YouTubeTranscriptApi,
+        NoTranscriptFound,
+        TranscriptsDisabled,
+        VideoUnavailable,
+    )
+    try:
+        api = YouTubeTranscriptApi()
+        # Try requested language first, then fall back to any available transcript
+        for langs in ([language], None):
+            try:
+                kwargs = {"languages": langs} if langs else {}
+                transcript = api.fetch(video_id, **kwargs)
+                return " ".join(s.text for s in transcript).strip()
+            except NoTranscriptFound:
+                if langs is None:
+                    return None
+        return None
+    except (TranscriptsDisabled, VideoUnavailable):
+        return None
+    except Exception:
+        return None
 
 
 def _extract_info_with_fallback(url: str, ydl_opts: dict) -> dict:
@@ -1061,6 +1111,30 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
         "it": "it-IT", "pt": "pt-BR", "nl": "nl-NL", "ja": "ja-JP",
         "ko": "ko-KR", "zh": "zh-CN",
     }
+
+    # --- Fast path: YouTube-direct transcript (no yt-dlp, no bot check) ---
+    yt_id = _youtube_video_id(url)
+    if yt_id:
+        text = _fetch_youtube_transcript(yt_id, language)
+        if text:
+            # Get lightweight metadata via yt-dlp (rarely bot-checked for flat extract)
+            meta: dict = {}
+            try:
+                with yt_dlp.YoutubeDL(make_ydl_opts(skip_download=True, extract_flat=True)) as ydl:
+                    meta = ydl.extract_info(url, download=False) or {}
+            except Exception:
+                pass
+            return {
+                "title": meta.get("title"),
+                "uploader": meta.get("uploader") or meta.get("channel"),
+                "duration_seconds": meta.get("duration"),
+                "upload_date": meta.get("upload_date"),
+                "url": url,
+                "language": language,
+                "transcript_text": text,
+                "transcript_source": "youtube_transcript_api",
+                "char_count": len(text),
+            }
 
     ydl_opts = make_ydl_opts(
         writesubtitles=True,

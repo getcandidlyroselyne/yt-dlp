@@ -21,5 +21,6 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
 
 RUN python -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('fastmcp') else 1)"
 RUN python -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('boto3') else 1)"
+RUN python -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('youtube_transcript_api') else 1)"
 
 CMD ["python", "server.py"]
