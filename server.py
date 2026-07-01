@@ -34,38 +34,66 @@ def _resolve_cookies_file() -> None:
     """
     If YTDLP_COOKIES_FILE is an https:// or s3:// URL, download it to a
     local temp file and update the env var to that path.
+    Supports both private S3 buckets (via boto3 IAM auth) and public HTTPS URLs.
     Runs once at startup so every tool picks up the local path transparently.
     """
     value = os.environ.get("YTDLP_COOKIES_FILE", "")
     if not value:
+        print("[server] YTDLP_COOKIES_FILE not set — YouTube requests may be blocked by IP",
+              flush=True)
         return
     if Path(value).is_file():
-        return  # already a valid local path
+        size = Path(value).stat().st_size
+        print(f"[server] cookies loaded from local path: {value} ({size} bytes)", flush=True)
+        return
 
     local_path = Path(tempfile.gettempdir()) / "ytdlp_cookies.txt"
 
+    # Parse S3 URLs: both s3:// and https://*.s3.*.amazonaws.com/* formats
+    s3_bucket: str | None = None
+    s3_key: str | None = None
+
     if value.startswith("s3://"):
+        parts = value[5:].split("/", 1)
+        s3_bucket, s3_key = parts[0], (parts[1] if len(parts) > 1 else "")
+    elif "s3." in value and "amazonaws.com" in value:
+        # e.g. https://bucket.s3.region.amazonaws.com/key
+        import urllib.parse as _up
+        parsed = _up.urlparse(value)
+        host_parts = parsed.netloc.split(".")
+        s3_bucket = host_parts[0]
+        s3_key = parsed.path.lstrip("/")
+
+    if s3_bucket and s3_key:
         try:
             import boto3 as _boto3
-            parts = value[5:].split("/", 1)
-            bucket, key = parts[0], parts[1] if len(parts) > 1 else ""
             region = os.environ.get("AWS_REGION", "us-east-1")
-            _boto3.client("s3", region_name=region).download_file(bucket, key, str(local_path))
+            _boto3.client("s3", region_name=region).download_file(
+                s3_bucket, s3_key, str(local_path)
+            )
+            size = local_path.stat().st_size
             os.environ["YTDLP_COOKIES_FILE"] = str(local_path)
+            print(f"[server] cookies downloaded from S3 s3://{s3_bucket}/{s3_key} "
+                  f"→ {local_path} ({size} bytes)", flush=True)
+            return
         except Exception as exc:
-            print(f"[server] WARNING: could not download cookies from S3 ({value}): {exc}",
-                  flush=True)
-        return
+            print(f"[server] WARNING: S3 cookies download failed: {exc}", flush=True)
 
     if value.startswith("https://") or value.startswith("http://"):
         try:
             req = urllib.request.Request(value, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=30) as resp:
-                local_path.write_bytes(resp.read())
+                data = resp.read()
+            local_path.write_bytes(data)
             os.environ["YTDLP_COOKIES_FILE"] = str(local_path)
-        except Exception as exc:
-            print(f"[server] WARNING: could not download cookies from URL ({value}): {exc}",
+            print(f"[server] cookies downloaded from URL → {local_path} ({len(data)} bytes)",
                   flush=True)
+            return
+        except Exception as exc:
+            print(f"[server] WARNING: HTTPS cookies download failed: {exc}", flush=True)
+
+    print(f"[server] WARNING: YTDLP_COOKIES_FILE='{value}' is not a valid path or URL — "
+          "cookies will not be used", flush=True)
 
 
 _resolve_cookies_file()
@@ -1465,6 +1493,59 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
         "transcript_source": "timeout",
         "job_name": job_name,
         "next_step": f"Job is still running. Call get_transcription_result('{job_name}') to check.",
+    }
+
+
+@mcp.tool()
+def check_server_config() -> dict:
+    """
+    Diagnostic tool — shows the server's current runtime configuration.
+    Use this to verify cookies, proxy, ffmpeg, and AWS settings are loaded correctly
+    before troubleshooting transcript or audio extraction failures.
+    """
+    cookies_raw = os.environ.get("YTDLP_COOKIES_FILE", "")
+    cookies_resolved = os.environ.get("YTDLP_COOKIES_FILE", "")
+    cookies_ok = bool(cookies_resolved and Path(cookies_resolved).is_file())
+    cookies_size = Path(cookies_resolved).stat().st_size if cookies_ok else None
+
+    ffmpeg_loc = _resolve_ffmpeg_location()
+    ffmpeg_bin = os.path.join(ffmpeg_loc, "ffmpeg") if ffmpeg_loc else shutil.which("ffmpeg")
+
+    try:
+        yt_api_version = __import__("youtube_transcript_api").__version__
+    except Exception:
+        yt_api_version = "not installed"
+
+    try:
+        curl_version = __import__("curl_cffi").__version__
+    except Exception:
+        curl_version = "not installed"
+
+    return {
+        "cookies": {
+            "env_value": cookies_raw or "(not set)",
+            "resolved_path": cookies_resolved or "(not set)",
+            "file_exists": cookies_ok,
+            "file_size_bytes": cookies_size,
+            "status": "OK — cookies will be used" if cookies_ok else
+                      "MISSING — YouTube requests will likely be IP-blocked",
+        },
+        "proxy": {
+            "YTDLP_PROXY": os.environ.get("YTDLP_PROXY", "(not set)"),
+            "HTTPS_PROXY": os.environ.get("HTTPS_PROXY", "(not set)"),
+        },
+        "ffmpeg": {
+            "binary": ffmpeg_bin or "(not found)",
+            "available": bool(ffmpeg_bin),
+        },
+        "dependencies": {
+            "youtube_transcript_api": yt_api_version,
+            "curl_cffi": curl_version,
+        },
+        "aws": {
+            "S3_BUCKET": os.environ.get("S3_BUCKET", "(not set)"),
+            "AWS_REGION": os.environ.get("AWS_REGION", "us-east-1"),
+        },
     }
 
 
