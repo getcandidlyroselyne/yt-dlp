@@ -247,18 +247,194 @@ def _youtube_video_id(url: str) -> str | None:
     return None
 
 
+_INVIDIOUS_INSTANCES = [
+    "https://inv.nadeko.net",
+    "https://invidious.nerdvpn.de",
+    "https://yt.cdaut.de",
+    "https://invidious.privacydev.net",
+    "https://invidious.perennialte.ch",
+]
+
+
+def _fetch_transcript_via_invidious(video_id: str, language: str) -> tuple[str | None, str | None]:
+    """
+    Fetch YouTube captions via public Invidious instances.
+    Invidious proxies caption requests through their own servers, bypassing
+    YouTube's datacenter IP blocks entirely — no cookies or proxy needed.
+    Tries multiple instances in order, returning the first successful result.
+    """
+    import json as _json
+    import re as _re
+
+    last_error: str = "no instances tried"
+    for instance in _INVIDIOUS_INSTANCES:
+        try:
+            req = urllib.request.Request(
+                f"{instance}/api/v1/captions/{video_id}",
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = _json.loads(resp.read())
+
+            captions = data.get("captions", [])
+            if not captions:
+                last_error = f"{instance}: no captions returned"
+                continue
+
+            # Prefer exact language match, then auto-generated, then anything
+            def _priority(cap: dict) -> int:
+                code = cap.get("language_code", "").lower()
+                label = cap.get("label", "").lower()
+                if code == language or code.startswith(f"{language}-"):
+                    return 0 if "auto" not in label else 1
+                return 2
+
+            captions.sort(key=_priority)
+            cap_path = captions[0].get("url", "")
+            cap_url = f"{instance}{cap_path}" if cap_path.startswith("/") else cap_path
+            sep = "&" if "?" in cap_url else "?"
+            cap_url += f"{sep}format=vtt"
+
+            req2 = urllib.request.Request(cap_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req2, timeout=15) as resp2:
+                vtt = resp2.read().decode("utf-8")
+
+            lines = []
+            for line in vtt.splitlines():
+                line = line.strip()
+                if not line or "-->" in line or line.upper().startswith("WEBVTT") or line.isdigit():
+                    continue
+                line = _re.sub(r"<[^>]+>", "", line)
+                if line:
+                    lines.append(line)
+
+            text = " ".join(lines).strip()
+            if text:
+                return text, None
+            last_error = f"{instance}: empty transcript after parsing"
+        except Exception as exc:
+            last_error = f"{instance}: {type(exc).__name__}: {exc}"
+
+    return None, f"All Invidious instances failed. Last error: {last_error}"
+
+
+def _parse_json3_transcript(data: dict) -> str:
+    """Parse YouTube json3 timed-text format into plain text."""
+    texts: list[str] = []
+    for ev in data.get("events", []):
+        for seg in ev.get("segs", []):
+            t = seg.get("utf8", "").strip()
+            if t and t != "\n":
+                texts.append(t)
+    return " ".join(texts).replace("  ", " ").strip()
+
+
 def _fetch_youtube_transcript(video_id: str, language: str) -> tuple[str | None, str | None]:
     """
-    Fetch YouTube transcript via youtube-transcript-api.
-    Calls YouTube's timedtext endpoint directly — no yt-dlp, no bot check.
+    Fetch YouTube transcript using yt-dlp iOS client + direct timedtext API.
 
-    Supports two env vars that help bypass cloud IP blocks:
-      YTDLP_COOKIES_FILE  — path to a Netscape cookies.txt from a logged-in browser
-      YTDLP_PROXY         — proxy URL e.g. http://user:pass@host:port
+    Strategy (each step tried in order):
+    1. yt-dlp with iOS player client + process=False → extracts timedtext URLs
+       without triggering bot-check or needing PO tokens; fetches the json3
+       timed-text file directly — works from cloud/datacenter IPs.
+    2. Invidious public API (multiple instances) — fallback when yt-dlp fails.
+    3. youtube-transcript-api with cookie-authenticated requests.Session —
+       last resort; requires YTDLP_COOKIES_FILE and non-blocked IP.
 
     Returns (text, error): text is the transcript string or None;
                            error describes why it failed (or None on success).
     """
+    # ------------------------------------------------------------------
+    # Step 1: yt-dlp iOS client → timedtext URL → direct HTTP fetch
+    # This bypasses the bot-check entirely: process=False skips the video
+    # format check that raises ExtractorError on cloud IPs.
+    # ------------------------------------------------------------------
+    try:
+        ydl_opts = make_ydl_opts(
+            # iOS client provides subtitle URLs without needing PO tokens or bot-check bypass.
+            # process=False is set on the extract_info call so we never reach
+            # process_video_result which errors on missing video formats.
+            extractor_args={"youtube": {"player_client": ["ios"]}},
+            # Suppress the PO-token warning — we only need subtitles, not streams.
+            no_warnings=True,
+        )
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(
+                f"https://www.youtube.com/watch?v={video_id}",
+                download=False,
+                process=False,
+            )
+
+        auto_caps: dict = info.get("automatic_captions", {})
+        manual_subs: dict = info.get("subtitles", {})
+
+        # Prefer manual subtitles, then auto-generated; match language code
+        def _find_entries(caps_dict: dict) -> list[dict]:
+            for code in [language, f"{language}-orig", language.split("-")[0]]:
+                if code in caps_dict:
+                    return caps_dict[code]
+            return []
+
+        entries = _find_entries(manual_subs) or _find_entries(auto_caps)
+        if not entries:
+            # Any auto-generated language — last resort
+            entries = next(iter(auto_caps.values()), [])
+
+        # Prefer json3 (easiest to parse), then srv1/srv2/vtt
+        pref = {"json3": 0, "srv3": 1, "srv2": 2, "srv1": 3, "vtt": 4}
+        entries_sorted = sorted(entries, key=lambda e: pref.get(e.get("ext", ""), 99))
+
+        for entry in entries_sorted:
+            sub_url = entry.get("url")
+            if not sub_url:
+                continue
+            try:
+                req = urllib.request.Request(
+                    sub_url,
+                    headers={"User-Agent": "Mozilla/5.0"},
+                )
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    raw = resp.read()
+
+                ext = entry.get("ext", "")
+                if ext == "json3":
+                    import json as _json
+
+                    text = _parse_json3_transcript(_json.loads(raw))
+                else:
+                    import re as _re
+
+                    lines: list[str] = []
+                    for line in raw.decode("utf-8").splitlines():
+                        line = line.strip()
+                        if not line or "-->" in line or line.upper().startswith("WEBVTT"):
+                            continue
+                        if line.isdigit():
+                            continue
+                        line = _re.sub(r"<[^>]+>", "", line)
+                        if line:
+                            lines.append(line)
+                    text = " ".join(lines).strip()
+
+                if text:
+                    return text, None
+            except Exception:
+                continue
+    except Exception as ytdlp_exc:
+        ytdlp_error = f"yt-dlp: {type(ytdlp_exc).__name__}: {ytdlp_exc}"
+    else:
+        ytdlp_error = "yt-dlp: no usable subtitle entries found"
+
+    # ------------------------------------------------------------------
+    # Step 2: Invidious public API fallback
+    # ------------------------------------------------------------------
+    text, inv_error = _fetch_transcript_via_invidious(video_id, language)
+    if text:
+        return text, None
+
+    # ------------------------------------------------------------------
+    # Step 3: youtube-transcript-api with cookie session
+    # ------------------------------------------------------------------
     try:
         from youtube_transcript_api import (
             YouTubeTranscriptApi,
@@ -269,9 +445,8 @@ def _fetch_youtube_transcript(video_id: str, language: str) -> tuple[str | None,
             IpBlocked,
         )
     except ImportError:
-        return None, "youtube-transcript-api is not installed"
+        return None, f"{ytdlp_error}; Invidious: {inv_error}; youtube-transcript-api not installed"
 
-    # v1.x: cookies and proxies go on a requests.Session passed as http_client.
     import http.cookiejar as _cookiejar
     import requests as _requests
 
@@ -294,7 +469,6 @@ def _fetch_youtube_transcript(video_id: str, language: str) -> tuple[str | None,
 
     try:
         api = YouTubeTranscriptApi(http_client=session)
-        # Try requested language first, then fall back to any available transcript
         for langs in ([language], None):
             try:
                 fetch_kwargs: dict = {"languages": langs} if langs else {}
@@ -303,14 +477,15 @@ def _fetch_youtube_transcript(video_id: str, language: str) -> tuple[str | None,
                 return text, None
             except NoTranscriptFound:
                 if langs is None:
-                    return None, f"No transcript available for video {video_id} in any language"
+                    return None, (
+                        f"No transcript available for video {video_id} in any language. "
+                        f"yt-dlp: {ytdlp_error}; Invidious: {inv_error}"
+                    )
         return None, "No transcript found"
     except (RequestBlocked, IpBlocked) as exc:
         return None, (
-            f"{type(exc).__name__}: YouTube is blocking requests from this server's IP. "
-            "Fix: set YTDLP_COOKIES_FILE=/path/to/cookies.txt (export from a browser logged "
-            "into YouTube using the 'Get cookies.txt LOCALLY' Chrome extension), "
-            "or set YTDLP_PROXY=http://your-proxy:port to route through a residential IP."
+            f"All methods blocked. yt-dlp: {ytdlp_error}; Invidious: {inv_error}; "
+            f"API: {type(exc).__name__}. Set YTDLP_PROXY=http://your-proxy:port."
         )
     except TranscriptsDisabled:
         return None, "Transcripts are disabled for this video"
