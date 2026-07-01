@@ -824,5 +824,66 @@ def get_transcription_result(job_name: str) -> dict:
     }
 
 
+@mcp.tool()
+def normalize_youtube_url(url: str) -> dict:
+    """
+    Convert any YouTube URL variant to the canonical https://www.youtube.com/watch?v=ID form.
+    Handles: youtu.be short links, YouTube Shorts (/shorts/), YouTube Live (/live/),
+    mobile links (m.youtube.com), embedded player URLs (/embed/), and URLs with
+    tracking or playlist parameters that obscure the video ID.
+    Use this before passing a YouTube URL to any other tool to ensure compatibility.
+    """
+    import urllib.parse
+
+    parsed = urllib.parse.urlparse(url.strip())
+    host = parsed.netloc.lower().removeprefix("www.").removeprefix("m.")
+    path = parsed.path
+    video_id: str | None = None
+
+    if host == "youtu.be":
+        video_id = path.lstrip("/").split("/")[0].split("?")[0]
+    elif host == "youtube.com":
+        if path.startswith("/watch"):
+            video_id = urllib.parse.parse_qs(parsed.query).get("v", [None])[0]
+        elif path.startswith("/shorts/"):
+            video_id = path.split("/shorts/")[1].split("/")[0].split("?")[0]
+        elif path.startswith("/live/"):
+            video_id = path.split("/live/")[1].split("/")[0].split("?")[0]
+        elif path.startswith("/embed/"):
+            video_id = path.split("/embed/")[1].split("/")[0].split("?")[0]
+        elif path.startswith("/v/"):
+            video_id = path.split("/v/")[1].split("/")[0].split("?")[0]
+
+    if not video_id or len(video_id) < 5:
+        return {
+            "error": "Could not extract a YouTube video ID from this URL",
+            "url": url,
+            "hint": "Provide a YouTube video URL (watch, youtu.be, Shorts, or Live link).",
+        }
+
+    _format_labels = {
+        "youtu.be": "short link (youtu.be)",
+        "/shorts/": "YouTube Shorts",
+        "/live/": "YouTube Live",
+        "/embed/": "embed URL",
+        "/v/": "legacy /v/ URL",
+    }
+    original_format = "standard watch URL"
+    if host == "youtu.be":
+        original_format = "short link (youtu.be)"
+    else:
+        for fragment, label in _format_labels.items():
+            if fragment in path:
+                original_format = label
+                break
+
+    return {
+        "canonical_url": f"https://www.youtube.com/watch?v={video_id}",
+        "video_id": video_id,
+        "original_url": url,
+        "original_format": original_format,
+    }
+
+
 if __name__ == "__main__":
     mcp.run()
