@@ -182,7 +182,13 @@ def _fetch_youtube_transcript(video_id: str, language: str) -> tuple[str | None,
     """
     Fetch YouTube transcript via youtube-transcript-api.
     Calls YouTube's timedtext endpoint directly — no yt-dlp, no bot check.
-    Returns (text, error): text is the transcript or None; error describes why it failed.
+
+    Supports two env vars that help bypass cloud IP blocks:
+      YTDLP_COOKIES_FILE  — path to a Netscape cookies.txt from a logged-in browser
+      YTDLP_PROXY         — proxy URL e.g. http://user:pass@host:port
+
+    Returns (text, error): text is the transcript string or None;
+                           error describes why it failed (or None on success).
     """
     try:
         from youtube_transcript_api import (
@@ -190,26 +196,48 @@ def _fetch_youtube_transcript(video_id: str, language: str) -> tuple[str | None,
             NoTranscriptFound,
             TranscriptsDisabled,
             VideoUnavailable,
+            RequestBlocked,
+            IpBlocked,
         )
     except ImportError:
         return None, "youtube-transcript-api is not installed"
 
+    # Build constructor kwargs from env vars
+    api_kwargs: dict = {}
+    cookies_file = os.environ.get("YTDLP_COOKIES_FILE")
+    if cookies_file and Path(cookies_file).is_file():
+        api_kwargs["cookies"] = cookies_file
+    proxy = (
+        os.environ.get("YTDLP_PROXY")
+        or os.environ.get("HTTPS_PROXY")
+        or os.environ.get("https_proxy")
+    )
+    if proxy:
+        api_kwargs["proxies"] = {"http": proxy, "https": proxy}
+
     try:
-        api = YouTubeTranscriptApi()
+        api = YouTubeTranscriptApi(**api_kwargs)
         # Try requested language first, then fall back to any available transcript
         for langs in ([language], None):
             try:
-                kwargs = {"languages": langs} if langs else {}
-                transcript = api.fetch(video_id, **kwargs)
+                fetch_kwargs = {"languages": langs} if langs else {}
+                transcript = api.fetch(video_id, **fetch_kwargs)
                 text = " ".join(s.text for s in transcript).strip()
                 return text, None
             except NoTranscriptFound:
                 if langs is None:
                     return None, f"No transcript available for video {video_id} in any language"
         return None, "No transcript found"
-    except (TranscriptsDisabled,):
+    except (RequestBlocked, IpBlocked) as exc:
+        return None, (
+            f"{type(exc).__name__}: YouTube is blocking requests from this server's IP. "
+            "Fix: set YTDLP_COOKIES_FILE=/path/to/cookies.txt (export from a browser logged "
+            "into YouTube using the 'Get cookies.txt LOCALLY' Chrome extension), "
+            "or set YTDLP_PROXY=http://your-proxy:port to route through a residential IP."
+        )
+    except TranscriptsDisabled:
         return None, "Transcripts are disabled for this video"
-    except (VideoUnavailable,):
+    except VideoUnavailable:
         return None, "Video is unavailable"
     except Exception as exc:
         return None, f"Transcript fetch error: {type(exc).__name__}: {exc}"
