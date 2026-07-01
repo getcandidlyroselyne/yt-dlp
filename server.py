@@ -748,33 +748,51 @@ def start_podcast_transcription(url: str, language_code: str = "en-US") -> dict:
     if not stream_url:
         return {"error": "Could not resolve a direct audio stream URL", "url": url, "step": "select_format"}
 
-    try:
-        # Step 2: Download audio into memory — no disk writes
-        req = urllib.request.Request(stream_url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            audio_bytes = io.BytesIO(resp.read())
-    except Exception as exc:
-        return {
-            "error": f"Failed to download audio stream: {exc}",
-            "url": url,
-            "stream_url": stream_url[:80] + "…",
-            "audio_ext": audio_ext,
-            "step": "download_stream",
-        }
+    # HLS/DASH streams (m3u8, mpd) can't be downloaded with a plain HTTP fetch —
+    # they're manifests, not audio files. Use yt-dlp + ffmpeg to remux them into
+    # a proper mp4 that AWS Transcribe can accept.
+    is_hls = audio_ext in ("m3u8", "mpd") or "m3u8" in stream_url or ".m3u8" in stream_url
+
+    bucket = s3_utils.bucket_name()
+    job_suffix = str(uuid.uuid4())[:8]
+    safe_title = s3_utils._safe_key(info.get("title") or "podcast")
 
     try:
-        # Step 3: Upload from memory directly to S3
-        bucket = s3_utils.bucket_name()
-        job_suffix = str(uuid.uuid4())[:8]
-        safe_title = s3_utils._safe_key(info.get("title") or "podcast")
-        audio_s3_key = f"podcast-audio/{safe_title}-{job_suffix}.{audio_ext}"
+        if is_hls:
+            # Step 2a: HLS — download via yt-dlp + ffmpeg into a temp file, then stream to S3
+            output_dir = tempfile.mkdtemp()
+            ydl_dl_opts = make_ydl_opts(
+                require_ffmpeg=True,
+                format="bestaudio[ext=m4a]/bestaudio[ext=mp4]/bestaudio/best",
+                outtmpl=os.path.join(output_dir, "audio.%(ext)s"),
+                restrictfilenames=True,
+                postprocessors=[{"key": "FFmpegExtractAudio", "preferredcodec": "mp4"}],
+            )
+            with yt_dlp.YoutubeDL(ydl_dl_opts) as ydl:
+                ydl.extract_info(url, download=True)
+            audio_files = list(Path(output_dir).glob("audio.*"))
+            if not audio_files:
+                return {"error": "ffmpeg remux produced no output file", "url": url, "step": "hls_download"}
+            audio_path = audio_files[0]
+            audio_ext = audio_path.suffix.lstrip(".")
+            audio_s3_key = f"podcast-audio/{safe_title}-{job_suffix}.{audio_ext}"
+            s3_client = boto3.client("s3", region_name=region)
+            with open(audio_path, "rb") as fh:
+                s3_client.upload_fileobj(fh, bucket, audio_s3_key)
+            shutil.rmtree(output_dir, ignore_errors=True)
+        else:
+            # Step 2b: Direct audio file — download into memory, no disk writes
+            req = urllib.request.Request(stream_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                audio_bytes = io.BytesIO(resp.read())
+            audio_s3_key = f"podcast-audio/{safe_title}-{job_suffix}.{audio_ext}"
+            s3_client = boto3.client("s3", region_name=region)
+            audio_bytes.seek(0)
+            s3_client.upload_fileobj(audio_bytes, bucket, audio_s3_key)
 
-        s3_client = boto3.client("s3", region_name=region)
-        audio_bytes.seek(0)
-        s3_client.upload_fileobj(audio_bytes, bucket, audio_s3_key)
         s3_uri = f"s3://{bucket}/{audio_s3_key}"
     except Exception as exc:
-        return {"error": f"S3 upload failed: {exc}", "url": url, "step": "s3_upload"}
+        return {"error": f"Audio download/upload failed: {exc}", "url": url, "step": "download_or_upload"}
 
     try:
         # Step 4: Start AWS Transcribe job and return immediately — no polling.
