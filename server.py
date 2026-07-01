@@ -759,27 +759,61 @@ def start_podcast_transcription(url: str, language_code: str = "en-US") -> dict:
 
     try:
         if is_hls:
-            # Step 2a: HLS — download via yt-dlp + ffmpeg into a temp file, then stream to S3
-            output_dir = tempfile.mkdtemp()
-            ydl_dl_opts = make_ydl_opts(
-                require_ffmpeg=True,
-                format="bestaudio[ext=m4a]/bestaudio[ext=mp4]/bestaudio/best",
-                outtmpl=os.path.join(output_dir, "audio.%(ext)s"),
-                restrictfilenames=True,
-                postprocessors=[{"key": "FFmpegExtractAudio", "preferredcodec": "mp4"}],
+            # Step 2a: HLS — pipe ffmpeg stdout directly to S3, zero disk writes.
+            # Writing HLS to a temp file fails in disk-constrained environments;
+            # MP3 is a streamable format so ffmpeg can write to pipe:1 without seeking.
+            import threading
+
+            ffmpeg_loc = _resolve_ffmpeg_location()
+            ffmpeg_bin = (
+                os.path.join(ffmpeg_loc, "ffmpeg") if ffmpeg_loc
+                else shutil.which("ffmpeg")
             )
-            with yt_dlp.YoutubeDL(ydl_dl_opts) as ydl:
-                ydl.extract_info(url, download=True)
-            audio_files = list(Path(output_dir).glob("audio.*"))
-            if not audio_files:
-                return {"error": "ffmpeg remux produced no output file", "url": url, "step": "hls_download"}
-            audio_path = audio_files[0]
-            audio_ext = audio_path.suffix.lstrip(".")
+            if not ffmpeg_bin:
+                return {
+                    "error": "ffmpeg is required to process HLS streams but was not found",
+                    "url": url,
+                    "step": "hls_ffmpeg_check",
+                    "hint": "Install ffmpeg or set FFMPEG_LOCATION env var.",
+                }
+
+            audio_ext = "mp3"
             audio_s3_key = f"podcast-audio/{safe_title}-{job_suffix}.{audio_ext}"
             s3_client = boto3.client("s3", region_name=region)
-            with open(audio_path, "rb") as fh:
-                s3_client.upload_fileobj(fh, bucket, audio_s3_key)
-            shutil.rmtree(output_dir, ignore_errors=True)
+
+            cmd = [
+                ffmpeg_bin, "-y",
+                "-i", stream_url,
+                "-vn",                    # strip video track
+                "-acodec", "libmp3lame",  # encode to MP3
+                "-q:a", "4",              # VBR ~165 kbps
+                "-f", "mp3",              # MP3 is fully streamable (no seek)
+                "pipe:1",
+            ]
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+            # Drain stderr on a background thread to prevent deadlock if the
+            # 64 KB pipe buffer fills before stdout (the audio stream) is fully read.
+            stderr_chunks: list[bytes] = []
+            def _drain_stderr() -> None:
+                stderr_chunks.append(proc.stderr.read())
+            drain_thread = threading.Thread(target=_drain_stderr, daemon=True)
+            drain_thread.start()
+
+            try:
+                s3_client.upload_fileobj(proc.stdout, bucket, audio_s3_key)
+            finally:
+                proc.stdout.close()
+                drain_thread.join()
+                proc.wait()
+
+            if proc.returncode != 0:
+                stderr_text = b"".join(stderr_chunks).decode(errors="replace")[-400:]
+                return {
+                    "error": f"ffmpeg HLS remux failed (exit {proc.returncode}): {stderr_text}",
+                    "url": url,
+                    "step": "hls_remux",
+                }
         else:
             # Step 2b: Direct audio file — download into memory, no disk writes
             req = urllib.request.Request(stream_url, headers={"User-Agent": "Mozilla/5.0"})
