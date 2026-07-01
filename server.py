@@ -246,17 +246,25 @@ def get_video_transcript(url: str, language: str = "en") -> dict:
         subtitleslangs=[language],
         skip_download=True,
     )
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-        subtitles = info.get("subtitles", {}) or info.get("automatic_captions", {})
-        transcript_url = None
-        if language in subtitles:
-            for fmt in subtitles[language]:
-                if fmt.get("ext") in ("vtt", "srv3", "json3"):
-                    transcript_url = fmt.get("url")
-                    break
+    try:
+        info = _extract_info_with_fallback(url, ydl_opts)
+    except Exception as exc:
+        return {
+            "title": None, "uploader": None, "duration_seconds": None,
+            "upload_date": None, "url": url,
+            "has_transcript": False, "transcript_url": None,
+            "transcript_source": "failed",
+            "error": str(exc)[:400],
+        }
+    subtitles = info.get("subtitles", {}) or info.get("automatic_captions", {})
+    transcript_url = None
+    if language in subtitles:
+        for fmt in subtitles[language]:
+            if fmt.get("ext") in ("vtt", "srv3", "json3"):
+                transcript_url = fmt.get("url")
+                break
 
-        if transcript_url is not None:
+    if transcript_url is not None:
             return {
                 "title": info.get("title"),
                 "uploader": info.get("uploader"),
@@ -819,8 +827,7 @@ def start_podcast_transcription(url: str, language_code: str = "en-US") -> dict:
 
     try:
         ydl_opts = make_ydl_opts(format="bestaudio[ext=m4a]/bestaudio[ext=mp4]/bestaudio/best")
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+        info = _extract_info_with_fallback(url, ydl_opts)
 
         formats = info.get("formats") or []
 
@@ -839,8 +846,9 @@ def start_podcast_transcription(url: str, language_code: str = "en-US") -> dict:
     except Exception:
         pass  # fall through to direct-URL path
 
-    # Fallback: treat the URL as a direct/redirect audio link.
-    # Follow redirects to find the real file URL and infer its format.
+    # Fallback: treat the URL as a direct/redirect audio link (e.g. swap.fm, podtrac).
+    # Only accept responses with an audio Content-Type — reject HTML pages so we
+    # never pass a webpage URL to ffmpeg (which would fill disk with probe temp files).
     if not stream_url:
         try:
             req = urllib.request.Request(
@@ -852,18 +860,32 @@ def start_podcast_transcription(url: str, language_code: str = "en-US") -> dict:
                 final_url = resp.url
                 content_type = resp.headers.get("Content-Type", "")
 
-            stream_url = final_url
-            # Infer extension from the resolved URL or Content-Type
+            _audio_ct = {
+                "audio/mpeg", "audio/mp4", "audio/x-m4a", "audio/ogg",
+                "audio/flac", "audio/wav", "audio/webm", "audio/aac",
+                "video/mp4", "video/webm",  # video containers often carry audio
+            }
+            ct_base = content_type.split(";")[0].strip().lower()
+            if ct_base not in _audio_ct:
+                return {
+                    "error": (
+                        f"URL resolved to a non-audio Content-Type ({ct_base!r}). "
+                        "yt-dlp could not extract a stream URL for this source. "
+                        "Provide a direct MP3/MP4/M4A file URL or a supported platform link."
+                    ),
+                    "url": url,
+                    "step": "resolve_url",
+                }
+
             _ct_map = {
                 "audio/mpeg": "mp3", "audio/mp4": "mp4",
                 "audio/x-m4a": "mp4", "audio/ogg": "ogg",
                 "audio/flac": "flac", "audio/wav": "wav",
-                "audio/webm": "webm",
+                "audio/webm": "webm", "audio/aac": "mp4",
+                "video/mp4": "mp4", "video/webm": "webm",
             }
-            audio_ext = _ct_map.get(content_type.split(";")[0].strip(), "mp3")
-            if audio_ext == "mp3" and ".mp3" not in final_url and ".m4a" in final_url:
-                audio_ext = "mp4"
-
+            audio_ext = _ct_map.get(ct_base, "mp3")
+            stream_url = final_url
             info = {"title": None, "uploader": None, "duration": None,
                     "upload_date": None, "description": None}
         except Exception as exc:
@@ -871,7 +893,7 @@ def start_podcast_transcription(url: str, language_code: str = "en-US") -> dict:
                 "error": f"Could not resolve audio URL (yt-dlp and direct fallback both failed): {exc}",
                 "url": url,
                 "step": "resolve_url",
-                "hint": "Provide the episode page URL (e.g. the podcast website or Apple Podcasts link), not a tracking/redirect MP3 link.",
+                "hint": "Provide the episode page URL or a direct MP3/MP4 link.",
             }
 
     if not stream_url:
@@ -902,6 +924,7 @@ def start_podcast_transcription(url: str, language_code: str = "en-US") -> dict:
             cmd = [
                 ffmpeg_bin, "-y",
                 "-i", stream_url,
+                "-t", "7200",            # cap at 2 hours — prevents disk fill on runaway streams
                 "-vn",                   # strip video
                 "-acodec", "libmp3lame",
                 "-ar", "16000",          # 16 kHz — standard for speech ASR
