@@ -915,6 +915,8 @@ def start_podcast_transcription(url: str, language_code: str = "en-US") -> dict:
                 "-i", stream_url,
                 "-vn",                    # strip video track
                 "-acodec", "libmp3lame",  # encode to MP3
+                "-ar", "16000",           # normalize to 16 kHz — standard for speech ASR
+                "-ac", "1",              # mono — halves file size, fine for speech
                 "-q:a", "4",              # VBR ~165 kbps
                 "-f", "mp3",              # MP3 is fully streamable (no seek)
                 "pipe:1",
@@ -971,14 +973,19 @@ def start_podcast_transcription(url: str, language_code: str = "en-US") -> dict:
         }
         media_format = _media_format_map.get(audio_ext, "mp4")
 
-        transcribe.start_transcription_job(
-            TranscriptionJobName=job_name,
-            Media={"MediaFileUri": s3_uri},
-            MediaFormat=media_format,
-            LanguageCode=language_code,
-            OutputBucketName=bucket,
-            OutputKey=transcript_s3_key,
-        )
+        transcribe_kwargs: dict = {
+            "TranscriptionJobName": job_name,
+            "Media": {"MediaFileUri": s3_uri},
+            "MediaFormat": media_format,
+            "LanguageCode": language_code,
+            "OutputBucketName": bucket,
+            "OutputKey": transcript_s3_key,
+        }
+        # For HLS-sourced MP3 we know the exact sample rate; passing it explicitly
+        # avoids the "Invalid sample rate" error when Transcribe auto-detection fails.
+        if is_hls:
+            transcribe_kwargs["MediaSampleRateHertz"] = 16000
+        transcribe.start_transcription_job(**transcribe_kwargs)
     except Exception as exc:
         return {
             "error": f"Failed to start AWS Transcribe job: {exc}",
