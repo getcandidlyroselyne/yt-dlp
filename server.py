@@ -265,41 +265,28 @@ def get_video_transcript(url: str, language: str = "en") -> dict:
                 break
 
     if transcript_url is not None:
-            return {
-                "title": info.get("title"),
-                "uploader": info.get("uploader"),
-                "duration_seconds": info.get("duration"),
-                "upload_date": info.get("upload_date"),
-                "url": url,
-                "transcript_url": transcript_url,
-                "has_transcript": True,
-                "transcript_source": "native_subtitles",
-            }
-
-        # No native subtitles — fall back to AWS Transcribe for audio-based sources
-        # (e.g. Dailymotion, Vimeo, and other platforms without captions).
-        language_code_map = {
-            "en": "en-US", "fr": "fr-FR", "de": "de-DE", "es": "es-ES",
-            "it": "it-IT", "pt": "pt-BR", "nl": "nl-NL", "ja": "ja-JP",
-            "ko": "ko-KR", "zh": "zh-CN",
+        return {
+            "title": info.get("title"),
+            "uploader": info.get("uploader"),
+            "duration_seconds": info.get("duration"),
+            "upload_date": info.get("upload_date"),
+            "url": url,
+            "transcript_url": transcript_url,
+            "has_transcript": True,
+            "transcript_source": "native_subtitles",
         }
-        language_code = language_code_map.get(language, f"{language}-{language.upper()}")
-        transcription = start_podcast_transcription(url, language_code=language_code)
 
-        if transcription.get("status") == "transcription_started":
-            return {
-                "title": info.get("title"),
-                "uploader": info.get("uploader"),
-                "duration_seconds": info.get("duration"),
-                "upload_date": info.get("upload_date"),
-                "url": url,
-                "has_transcript": False,
-                "transcript_url": None,
-                "transcript_source": "aws_transcribe_async",
-                "transcription_job_name": transcription.get("job_name"),
-                "next_step": f"Call get_transcription_result('{transcription.get('job_name')}') in 2-5 minutes to fetch the transcript.",
-            }
+    # No native subtitles — fall back to AWS Transcribe for audio-based sources
+    # (e.g. Dailymotion, Vimeo, and other platforms without captions).
+    language_code_map = {
+        "en": "en-US", "fr": "fr-FR", "de": "de-DE", "es": "es-ES",
+        "it": "it-IT", "pt": "pt-BR", "nl": "nl-NL", "ja": "ja-JP",
+        "ko": "ko-KR", "zh": "zh-CN",
+    }
+    language_code = language_code_map.get(language, f"{language}-{language.upper()}")
+    transcription = start_podcast_transcription(url, language_code=language_code)
 
+    if transcription.get("status") == "transcription_started":
         return {
             "title": info.get("title"),
             "uploader": info.get("uploader"),
@@ -308,9 +295,22 @@ def get_video_transcript(url: str, language: str = "en") -> dict:
             "url": url,
             "has_transcript": False,
             "transcript_url": None,
-            "transcript_source": "none",
-            "error": transcription.get("error", "No subtitles available and transcription could not be started."),
+            "transcript_source": "aws_transcribe_async",
+            "transcription_job_name": transcription.get("job_name"),
+            "next_step": f"Call get_transcription_result('{transcription.get('job_name')}') in 2-5 minutes to fetch the transcript.",
         }
+
+    return {
+        "title": info.get("title"),
+        "uploader": info.get("uploader"),
+        "duration_seconds": info.get("duration"),
+        "upload_date": info.get("upload_date"),
+        "url": url,
+        "has_transcript": False,
+        "transcript_url": None,
+        "transcript_source": "none",
+        "error": transcription.get("error", "No subtitles available and transcription could not be started."),
+    }
 
 
 @mcp.tool()
